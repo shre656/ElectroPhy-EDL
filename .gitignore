@@ -1,0 +1,39 @@
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# =========================
+# Pico C/C++ Code
+# =========================
+pico_code/build_w/
+pico_code/build/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.map
+*.dis
+# Optional: Ignore the SDK if it's downloaded directly into the folder rather than linked
+# pico_code/pico-sdk/ 
+
+# =========================
+# Python Backend
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+electrophy_studio/backend/backend_venv/
+electrophy_studio/backend/.env
+
+# =========================
+# Node.js Frontend
+# =========================
+electrophy_studio/frontend/node_modules/
+electrophy_studio/frontend/dist/
+electrophy_studio/frontend/.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
