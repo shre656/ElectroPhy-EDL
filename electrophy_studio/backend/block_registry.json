@@ -25,5 +25,6 @@
   },
   "0xA4": { "id": "math_fft", "label": "FFT (1D Spectrum)", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
   "0xA5": { "id": "math_hpf", "label": "High-Pass Filter", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
+  "0xA6": { "id": "math_lpf", "label": "Low-Pass Filter", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
   "0xC1": { "id": "plot_freq", "label": "Spectrum Plot", "category": "action", "domain": "pc", "inputs": 1, "outputs": 0, "config": {} }
 }

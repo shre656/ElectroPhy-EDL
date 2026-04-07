@@ -301,6 +301,25 @@ async def websocket_endpoint(websocket: WebSocket):
                                         node_state_memory[nid]["x_prev"] = in_val
                                         node_state_memory[nid]["y_prev"] = y
                                         node_state[nid]["out_0"] = y
+                                        
+                                    elif op == "math_lpf":
+                                        in_val = inputs.get("in_0", 0.0)
+                                        # Use the threshold parameter as the Cutoff Frequency (Hz)
+                                        try: fc = float(n["params"].get("threshold", 5.0)) # Default 5Hz cutoff
+                                        except ValueError: fc = 5.0
+                                        
+                                        dt = 0.01 # Assuming 100Hz loop rate from Pico
+                                        rc = 1.0 / (2 * math.pi * fc) if fc > 0 else 1.0
+                                        alpha = dt / (rc + dt)
+                                        
+                                        # Initialize y_prev with the first input value to prevent a startup spike
+                                        y_prev = node_state_memory[nid].get("y_prev", in_val)
+                                        
+                                        # First-order low-pass filter equation
+                                        y = y_prev + alpha * (in_val - y_prev)
+                                        
+                                        node_state_memory[nid]["y_prev"] = y
+                                        node_state[nid]["out_0"] = y
 
                                     elif op == "math_fft":
                                         in_val = inputs.get("in_0", 0.0)
