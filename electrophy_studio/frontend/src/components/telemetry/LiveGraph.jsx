@@ -3,30 +3,35 @@ import Plotly from 'plotly.js-dist-min';
 
 const LiveGraph = ({ theme, isDarkMode }) => {
   const [isConnected, setIsConnected] = useState(false);
-  
-  // NEW: State to control the Y-Axis lock
-  const [yRange, setYRange] = useState('20'); 
+  const [yRange, setYRange] = useState('20');
+  const [isStreaming, setIsStreaming] = useState(false); 
+  const [plotConfigs, setPlotConfigs] = useState({}); 
 
-  const containerRef = useRef(null);
   const ws = useRef(null);
-  
   const plotRefs = useRef({}); 
   const dataBuffer = useRef({}); 
   const xCounter = useRef(0);
+  const animationFrameId = useRef(null);
 
   const MAX_POINTS = 300;
   const traceColors = ['#8b5cf6', '#10b981', '#f59e0b', '#3b82f6'];
 
-  // NEW: Dynamically update the layout of existing plots when the dropdown changes
+  const startStream = () => fetch('http://localhost:8000/api/stream/start', { method: 'POST' })
+    .then(() => setIsStreaming(true))
+    .catch(err => console.error("Failed to start stream", err));
+    
+  const stopStream  = () => fetch('http://localhost:8000/api/stream/stop',  { method: 'POST' })
+    .then(() => setIsStreaming(false))
+    .catch(err => console.error("Failed to stop stream", err));
+
   useEffect(() => {
-    Object.values(plotRefs.current).forEach(pState => {
-      if (pState.initialized && pState.type === 'time') {
-        if (yRange === 'auto') {
-          Plotly.relayout(pState.div, { 'yaxis.autorange': true });
-        } else {
-          const limit = Number(yRange);
-          Plotly.relayout(pState.div, { 'yaxis.range': [-limit, limit] });
-        }
+    Object.keys(plotRefs.current).forEach(id => {
+      const pState = plotRefs.current[id];
+      if (pState && pState.type === 'time') {
+        const layoutUpdate = yRange === 'auto' 
+          ? { 'yaxis.autorange': true } 
+          : { 'yaxis.range': [-Number(yRange), Number(yRange)] };
+        Plotly.relayout(`plot-${id}`, layoutUpdate);
       }
     });
   }, [yRange]);
@@ -34,17 +39,13 @@ const LiveGraph = ({ theme, isDarkMode }) => {
   useEffect(() => {
     if (!theme) return;
 
-    const plotBg = isDarkMode ? theme.bg : '#f9fafb';
-    const paperBg = isDarkMode ? theme.panelBg : '#ffffff';
-    const gridColor = isDarkMode ? theme.border : '#374151'; 
-    const axisColor = isDarkMode ? theme.textMuted : '#9ca3af';
-
     const defaultLayout = {
       autosize: true, margin: { l: 40, r: 16, t: 30, b: 30 },
-      plot_bgcolor: plotBg, paper_bgcolor: paperBg,
-      font: { color: axisColor, family: theme.monoFont, size: 10 },
-      xaxis: { gridcolor: gridColor, zerolinecolor: gridColor, showgrid: true },
-      yaxis: { gridcolor: gridColor, zerolinecolor: gridColor, showgrid: true },
+      plot_bgcolor: isDarkMode ? theme.bg : '#f9fafb',
+      paper_bgcolor: isDarkMode ? theme.panelBg : '#ffffff',
+      font: { color: isDarkMode ? theme.textMuted : '#9ca3af', family: theme.monoFont, size: 10 },
+      xaxis: { gridcolor: isDarkMode ? theme.border : '#374151', showgrid: true },
+      yaxis: { gridcolor: isDarkMode ? theme.border : '#374151', showgrid: true },
       showlegend: false
     };
 
@@ -55,161 +56,176 @@ const LiveGraph = ({ theme, isDarkMode }) => {
     ws.current.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data);
+        let hasNewPlots = false;
 
         Object.keys(payload).forEach(plotId => {
           const pData = payload[plotId];
 
           if (!dataBuffer.current[plotId]) {
             dataBuffer.current[plotId] = { type: pData.type, pendingX: [], pendingY: [], latestFreq: null, title: pData.title };
+            plotRefs.current[plotId] = { initialized: false, type: pData.type };
+            hasNewPlots = true;
           }
 
           if (pData.type === 'time') {
+            // FIXED: X-axis counter bug
             const currentX = xCounter.current++;
-            dataBuffer.current[plotId].pendingX.push(pData.data.map(() => currentX));
+            dataBuffer.current[plotId].pendingX.push(currentX);
             dataBuffer.current[plotId].pendingY.push(pData.data);
           } else if (pData.type === 'freq') {
             dataBuffer.current[plotId].latestFreq = pData.data; 
           }
         });
-      } catch (err) {
-        // Ignore bad frames
-      }
+
+        if (hasNewPlots) {
+          setPlotConfigs(prev => {
+            const next = { ...prev };
+            Object.keys(payload).forEach(id => {
+              if (!next[id]) next[id] = { type: payload[id].type, title: payload[id].title };
+            });
+            return next;
+          });
+        }
+      } catch (err) { /* Ignore bad frames */ }
     };
 
-    let animationFrameId;
     const renderLoop = () => {
       Object.keys(dataBuffer.current).forEach(plotId => {
         const buffer = dataBuffer.current[plotId];
-
-        // Inside renderLoop(), replace the block that creates the DIV:
-        if (!plotRefs.current[plotId]) {
-          const newDiv = document.createElement('div');
-          // SMART GRID SIZING:
-          newDiv.style.gridColumn = buffer.type === 'freq' ? '1 / -1' : 'auto'; // FFT goes full width, Time goes 50%
-          newDiv.style.height = '280px'; // Lock the height so it doesn't bounce
-          
-          newDiv.style.border = `1px solid ${theme.border}`;
-          newDiv.style.borderRadius = theme.radius;
-          newDiv.style.overflow = 'hidden';
-          newDiv.style.backgroundColor = isDarkMode ? theme.panelBg : '#ffffff';
-          
-          containerRef.current.appendChild(newDiv);
-          plotRefs.current[plotId] = { div: newDiv, initialized: false, type: buffer.type };
-        }
-
         const pState = plotRefs.current[plotId];
+        const divId = `plot-${plotId}`;
+        
+        const graphDiv = document.getElementById(divId);
+        if (!graphDiv) return;
 
-        // TIME SERIES
-        if (buffer.type === 'time' && buffer.pendingY.length > 0) {
-          if (!pState.initialized) {
-            const traces = buffer.pendingY[0].map((_, i) => ({
-              x: [], y: [], type: 'scatter', mode: 'lines',
-              line: { color: traceColors[i % traceColors.length], width: 1.5 },
-              hoverinfo: 'none' 
-            }));
+        // NEW: Try/Catch around Plotly ensures the render loop never dies
+        try {
+          // --- TIME SERIES ---
+          if (buffer.type === 'time' && buffer.pendingY.length > 0) {
+            const currentNumTraces = buffer.pendingY[0].length;
 
-            // Apply the initial Y-Axis config based on the dropdown state
-            const yAxisConfig = yRange === 'auto' 
-              ? { ...defaultLayout.yaxis, autorange: true } 
-              : { ...defaultLayout.yaxis, range: [-Number(yRange), Number(yRange)] };
+            // NEW: Self-Healing Logic! If you unplugged a wire, wipe the graph and restart it.
+            if (pState.initialized && graphDiv.data && graphDiv.data.length !== currentNumTraces) {
+              Plotly.purge(divId);
+              pState.initialized = false;
+            }
 
-            Plotly.newPlot(pState.div, traces, { ...defaultLayout, title: buffer.title, yaxis: yAxisConfig }, { staticPlot: true }); 
-            pState.initialized = true;
-          } else {
-            const numTraces = buffer.pendingY[0].length;
-            const updateX = Array.from({length: numTraces}, () => []);
-            const updateY = Array.from({length: numTraces}, () => []);
-            
-            buffer.pendingY.forEach((valArray, rowIndex) => {
-              valArray.forEach((val, traceIndex) => {
-                updateX[traceIndex].push(buffer.pendingX[rowIndex][0]);
-                updateY[traceIndex].push(val);
+            if (!pState.initialized) {
+              const traces = Array.from({length: currentNumTraces}, (_, i) => ({
+                x: [], y: [], type: 'scatter', mode: 'lines',
+                line: { color: traceColors[i % traceColors.length], width: 1.5 },
+                hoverinfo: 'none' 
+              }));
+              const yAxis = yRange === 'auto' ? { autorange: true } : { range: [-Number(yRange), Number(yRange)] };
+              Plotly.newPlot(divId, traces, { ...defaultLayout, title: buffer.title, yaxis: { ...defaultLayout.yaxis, ...yAxis } }, { staticPlot: true }); 
+              pState.initialized = true;
+            } else {
+              const updateX = Array.from({length: currentNumTraces}, () => []);
+              const updateY = Array.from({length: currentNumTraces}, () => []);
+              
+              buffer.pendingY.forEach((valArray, rowIndex) => {
+                // Ignore weird frames during compiler transitions
+                if (valArray.length !== currentNumTraces) return; 
+
+                valArray.forEach((val, traceIndex) => {
+                  updateX[traceIndex].push(buffer.pendingX[rowIndex]);
+                  updateY[traceIndex].push(val);
+                });
               });
-            });
 
-            const traceIndices = Array.from({length: numTraces}, (_, i) => i);
-            Plotly.extendTraces(pState.div, { x: updateX, y: updateY }, traceIndices, MAX_POINTS);
+              if (updateX[0].length > 0) {
+                Plotly.extendTraces(divId, { x: updateX, y: updateY }, Array.from({length: currentNumTraces}, (_, i) => i), MAX_POINTS);
+              }
+            }
+            buffer.pendingX = []; buffer.pendingY = [];
           }
-          
-          buffer.pendingX = [];
-          buffer.pendingY = [];
-        }
 
-        // FREQUENCY (FFT)
-        if (buffer.type === 'freq' && buffer.latestFreq) {
-          const freqs = Array.from({length: buffer.latestFreq.length}, (_, i) => i);
-          const trace = { x: freqs, y: buffer.latestFreq, type: 'bar', marker: { color: theme.accent }, hoverinfo: 'none' };
-          
-          // FFT ranges are usually best left on auto or fixed to a specific positive bound, we'll fix the Y-axis to 50 for stability
-          const fftLayout = { ...defaultLayout, title: buffer.title, yaxis: { ...defaultLayout.yaxis, range: [0, 50] } };
+          // --- FFT / FREQUENCY ---
+          if (buffer.type === 'freq' && buffer.latestFreq) {
+            const freqs = Array.from({length: buffer.latestFreq.length}, (_, i) => i);
+            const trace = { x: freqs, y: buffer.latestFreq, type: 'bar', marker: { color: theme.accent }, hoverinfo: 'none' };
+            const fftLayout = { ...defaultLayout, title: buffer.title, yaxis: { ...defaultLayout.yaxis, range: [0, 50] } };
 
-          if (!pState.initialized) {
-            Plotly.newPlot(pState.div, [trace], fftLayout, { staticPlot: true });
-            pState.initialized = true;
-          } else {
-            Plotly.react(pState.div, [trace], fftLayout, { staticPlot: true });
+            if (!pState.initialized) {
+              Plotly.newPlot(divId, [trace], fftLayout, { staticPlot: true });
+              pState.initialized = true;
+            } else {
+              Plotly.react(divId, [trace], fftLayout, { staticPlot: true });
+            }
+            buffer.latestFreq = null; 
           }
-          
-          buffer.latestFreq = null; 
+        } catch (err) {
+           // If Plotly still somehow errors out, flag it to re-initialize next frame
+           pState.initialized = false;
+           buffer.pendingX = []; buffer.pendingY = [];
         }
       });
 
-      animationFrameId = requestAnimationFrame(renderLoop);
+      animationFrameId.current = requestAnimationFrame(renderLoop);
     };
 
     renderLoop();
+    startStream();
 
     return () => {
-      cancelAnimationFrame(animationFrameId);
+      cancelAnimationFrame(animationFrameId.current);
       if (ws.current) ws.current.close();
-      Object.values(plotRefs.current).forEach(p => Plotly.purge(p.div));
+      Object.keys(plotRefs.current).forEach(id => Plotly.purge(`plot-${id}`));
+      stopStream();
     };
-  // We explicitly DO NOT include yRange in this dependency array so the websocket doesn't reconnect when changing scale!
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [theme, isDarkMode]);
+  }, [theme, isDarkMode]); 
 
   if (!theme) return null;
 
-return (
+  return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', gap: '10px' }}>
       
-      {/* HEADER WITH DROPDOWN */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', backgroundColor: theme.panelHeader, border: `1px solid ${theme.border}`, borderRadius: theme.radius, fontFamily: theme.monoFont, fontSize: '12px' }}>
         <div>
           <span style={{ color: isConnected ? theme.success : theme.danger }}>{isConnected ? 'STREAM LIVE' : 'NO SIGNAL'}</span>
           <span style={{ color: theme.textMuted, marginLeft: '16px' }}>60 FPS HARDWARE ACCELERATED</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ color: theme.textMuted }}>TIME Y-AXIS:</span>
-          <select 
-            value={yRange} 
-            onChange={(e) => setYRange(e.target.value)}
-            style={{ backgroundColor: theme.bg, color: theme.textMain, border: `1px solid ${theme.border}`, padding: '4px 8px', borderRadius: '4px', outline: 'none', fontFamily: theme.monoFont, fontSize: '11px', cursor: 'pointer' }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          
+          <button 
+            onClick={isStreaming ? stopStream : startStream}
+            style={{ 
+              backgroundColor: isStreaming ? theme.danger : theme.success, 
+              color: '#fff', border: 'none', padding: '4px 12px', 
+              borderRadius: '4px', cursor: 'pointer', fontFamily: theme.monoFont, fontWeight: 'bold' 
+            }}
           >
+            {isStreaming ? 'PAUSE STREAM' : 'START STREAM'}
+          </button>
+
+          <span style={{ color: theme.textMuted }}>TIME Y-AXIS:</span>
+          <select value={yRange} onChange={(e) => setYRange(e.target.value)} style={{ backgroundColor: theme.bg, color: theme.textMain, border: `1px solid ${theme.border}`, padding: '4px 8px', borderRadius: '4px', outline: 'none', fontFamily: theme.monoFont }}>
             <option value="auto">Auto-Scale</option>
             <option value="2">± 2</option>
             <option value="10">± 10</option>
             <option value="20">± 20 (IMU)</option>
             <option value="50">± 50</option>
-            <option value="100">± 100</option>
             <option value="1000">± 1000 (ToF)</option>
           </select>
         </div>
       </div>
       
-      {/* THE NEW SMART GRID CONTAINER */}
-      <div 
-        ref={containerRef} 
-        style={{ 
-          flex: 1, 
-          display: 'grid', 
-          gridTemplateColumns: 'repeat(auto-fit, minmax(45%, 1fr))', // Fits two graphs side-by-side perfectly
-          alignContent: 'start',
-          gap: '12px', 
-          overflowY: 'auto',
-          paddingBottom: '20px'
-        }} 
-      />
+      <div style={{ flex: 1, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(45%, 1fr))', alignContent: 'start', gap: '12px', overflowY: 'auto', paddingBottom: '20px' }}>
+        {Object.entries(plotConfigs).map(([id, config]) => (
+          <div 
+            key={id} 
+            id={`plot-${id}`} 
+            style={{ 
+              height: '280px', 
+              border: `1px solid ${theme.border}`, 
+              borderRadius: theme.radius, 
+              overflow: 'hidden', 
+              backgroundColor: isDarkMode ? theme.panelBg : '#ffffff',
+              gridColumn: config.type === 'freq' ? '1 / -1' : 'auto' 
+            }} 
+          />
+        ))}
+      </div>
     </div>
   );
 };

@@ -1,28 +1,17 @@
 {
-  "0x01": { "id": "tof", "label": "VL53L0CX ToF", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 1, "config": { "options": ["Distance (mm)", "Ambient Light"] } },
-  "0x02": { "id": "bno", "label": "BNO055 IMU", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 6, "config": { "outputs": ["Accel X", "Accel Y", "Accel Z", "Pitch", "Roll", "Yaw"] } },
-  "0x10": { "id": "threshold", "label": "Threshold Cutoff", "category": "logic", "domain": "chip", "inputs": 1, "outputs": 1, "config": {} },
-  "0x22": { "id": "fft", "label": "1D FFT (Core 1)", "category": "math", "domain": "chip", "inputs": 1, "outputs": 1, "config": {} },
-  "0x30": { "id": "transport_out", "label": "USB TX (Send to PC)", "category": "action", "domain": "chip", "inputs": 6, "outputs": 0, "config": { "inputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
-  "0xA0": { "id": "transport_in", "label": "USB RX (Read from Chip)", "category": "sensor", "domain": "pc", "inputs": 0, "outputs": 6, "config": { "outputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
+  "0x01": { "id": "mpu6050", "label": "MPU-6050 IMU", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 6, "config": { "outputs": ["Accel X", "Accel Y", "Accel Z", "Gyro X", "Gyro Y", "Gyro Z"] } },
+  "0x02": { "id": "ina219", "label": "INA219 Power", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 2, "config": { "outputs": ["Bus V", "Shunt mV"] } },
+  "0x03": { "id": "ldr", "label": "LDR Light Sensor", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 1, "config": {} },
+  "0x04": { "id": "mic", "label": "PDM Microphone", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 1, "config": {} },
+  
+  "0x10": { "id": "threshold", "label": "Threshold Clamp", "category": "logic", "domain": "chip", "inputs": 1, "outputs": 1, "config": {} },
+  "0x30": { "id": "transport_out", "label": "USB TX (To PC)", "category": "action", "domain": "chip", "inputs": 6, "outputs": 0, "config": { "inputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
+  
+  "0xA0": { "id": "transport_in", "label": "USB RX (From Chip)", "category": "sensor", "domain": "pc", "inputs": 0, "outputs": 6, "config": { "outputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
   "0xC0": { "id": "plot", "label": "Live Plot", "category": "action", "domain": "pc", "inputs": 4, "outputs": 0, "config": { "inputs": ["Trace 1", "Trace 2", "Trace 3", "Trace 4"] } },
-  "0xA1": { "id": "math_mult", "label": "Math: Multiply", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
+  
   "0xA2": { "id": "math_add", "label": "Math: Add", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
-  "0xB1": { "id": "csv", "label": "Save to CSV", "category": "action", "domain": "pc", "inputs": 1, "outputs": 0, "config": {} },
-  "0x40": { "id": "chip_drop", "label": "Drop Data Sink", "category": "action", "domain": "chip", "inputs": 1, "outputs": 0, "config": {} },
-  "0xD0": { "id": "pc_drop", "label": "Drop Data Sink", "category": "action", "domain": "pc", "inputs": 1, "outputs": 0, "config": {} },
-  "0xA3": { 
-    "id": "math_mag", 
-    "label": "Magnitude 3D", 
-    "category": "math", 
-    "domain": "pc", 
-    "inputs": 3, 
-    "outputs": 1, 
-    "config": { 
-      "inputs": ["X", "Y", "Z"],
-      "outputs": ["Mag Out"]
-    } 
-  },
+  "0xA3": { "id": "math_mag", "label": "Magnitude 3D", "category": "math", "domain": "pc", "inputs": 3, "outputs": 1, "config": { "inputs": ["X", "Y", "Z"], "outputs": ["Mag Out"] } },
   "0xA4": { "id": "math_fft", "label": "FFT (1D Spectrum)", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
   "0xA5": { "id": "math_hpf", "label": "High-Pass Filter", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
   "0xA6": { "id": "math_lpf", "label": "Low-Pass Filter", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },

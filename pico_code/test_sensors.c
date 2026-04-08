@@ -8,6 +8,8 @@
 #include "hardware/pio.h"
 #include "uart_tx.pio.h"
 #include "uart_rx.pio.h"
+#include "pico/pdm_microphone.h"
+#include <stdlib.h> // For abs()
 
 // ==========================================
 // 🛑 CHANGE THESE TO YOUR 2.4GHz HOTSPOT DETAILS!
@@ -328,41 +330,79 @@ void test_ldr() {
     wprintf("\nLDR Stream Stopped.\n");
 }
 
-void test_microphone() {
-    wprintf("\n--- STREAMING SPH064 MICROPHONE ---\n");
-    gpio_init(MIC_CLK_PIN); gpio_set_dir(MIC_CLK_PIN, GPIO_OUT);
-    gpio_init(MIC_DAT_PIN); gpio_set_dir(MIC_DAT_PIN, GPIO_IN);
+// We use a global buffer to catch the audio data in the background
+int16_t sample_buffer[256];
+volatile int samples_read = 0;
+volatile bool new_data = false;
 
-    // FIX 1: Throw away leftover keys
+// This callback fires automatically in the background when the DMA buffer is full
+void on_pdm_samples_ready() {
+    samples_read = pdm_microphone_read(sample_buffer, 256);
+    new_data = true;
+}
+
+void test_microphone() {
+    wprintf("\n--- STREAMING SPH064 (VIA PIO & DMA) ---\n");
+
+    // 1. Configure the Microphone Library
+    struct pdm_microphone_config config = {
+        .gpio_data = MIC_DAT_PIN,
+        .gpio_clk = MIC_CLK_PIN,
+        .pio = pio1, // Use pio1 so we don't conflict with your WiFi on pio0!
+        .pio_sm = 0,
+        .sample_rate = 16000,       // 16 kHz audio
+        .sample_buffer_size = 256,
+    };
+
+    if (pdm_microphone_init(&config) < 0) {
+        wprintf("[ERROR] Failed to initialize PDM microphone library.\n");
+        return;
+    }
+
+    pdm_microphone_set_samples_ready_handler(on_pdm_samples_ready);
+    pdm_microphone_start();
+
+    // Flush leftover keys
     while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
-    
-    wprintf("Press ANY key in terminal to stop stream...\n\n");
+    wprintf("Mic is LIVE. Speak into it! Press ANY key to stop...\n\n");
+
     int absolute_max_peak = 0;
 
     while (wgetchar(0) == PICO_ERROR_TIMEOUT) {
-        int local_max = 0;
-        for (int snapshot = 0; snapshot < 20; snapshot++) {
-            int high_count = 0;
-            for (int j = 0; j < 1000; j++) {
-                gpio_put(MIC_CLK_PIN, 0); __asm volatile ("nop\nnop\n");
-                gpio_put(MIC_CLK_PIN, 1);
-                if (gpio_get(MIC_DAT_PIN)) high_count++;
-                __asm volatile ("nop\nnop\n");
-            }
-            int deviation = high_count - 500;
-            if (deviation < 0) deviation = -deviation;
-            int score = (deviation * 100) / 250;
-            if (score > local_max) local_max = score;
-        }
-        if (local_max > absolute_max_peak) absolute_max_peak = local_max;
+        // Wait for the background hardware to hand us a new batch of audio
+        if (new_data) {
+            new_data = false;
+            int local_peak = 0;
 
-        wprintf("Vol [");
-        for (int v = 0; v < 20; v++) {
-            if (v < local_max) wprintf("#"); else wprintf(" ");
+            // Find the loudest noise in this specific batch of audio (PCM data)
+            for (int i = 0; i < samples_read; i++) {
+                int amplitude = abs(sample_buffer[i]);
+                if (amplitude > local_peak) {
+                    local_peak = amplitude;
+                }
+            }
+
+            // Scale the raw 16-bit PCM value down so it fits nicely on a terminal bar graph
+            int scaled_peak = local_peak / 500; 
+            if (scaled_peak > 25) scaled_peak = 25; // Cap it for the visualizer
+            
+            if (scaled_peak > absolute_max_peak) {
+                absolute_max_peak = scaled_peak;
+            }
+
+            // Print the visualizer
+            wprintf("Vol [");
+            for (int v = 0; v < 25; v++) {
+                if (v < scaled_peak) wprintf("#"); else wprintf(" ");
+            }
+            wprintf("] Peak: %5d\n", local_peak);
         }
-        // FIX 2: Use \n instead of \r
-        wprintf("] Current: %2d | PEAK: %2d\n", local_max, absolute_max_peak);
-        sleep_ms(50);
+        
+        sleep_ms(10); // Tiny sleep, no CPU hogging!
     }
+
+    // Cleanup
+    pdm_microphone_stop();
+    pdm_microphone_deinit();
     wprintf("\nMic Stream Stopped.\n");
 }
