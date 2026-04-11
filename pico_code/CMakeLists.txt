@@ -61,7 +61,7 @@ pico_enable_stdio_uart(hw_debug 0)
 pico_add_extra_outputs(hw_debug)
 
 # ==============================================================================
-# TARGET 3: External Pico W Sensor Tester (Now with Wi-Fi!)
+# TARGET 3: External Sensor Tester (Now with Wi-Fi!)
 # ==============================================================================
 add_executable(test_sensors 
     test_sensors.c
@@ -84,3 +84,24 @@ target_link_libraries(test_sensors
 pico_enable_stdio_usb(test_sensors 1)
 pico_enable_stdio_uart(test_sensors 0)
 pico_add_extra_outputs(test_sensors)
+
+# ==============================================================================
+# TARGET 4: USB Audio and DSP Debugger (Microphone & FFT)
+# ==============================================================================
+add_executable(mic_usb_debug 
+    hw_debug/mic_usb_debug.c
+)
+
+target_include_directories(mic_usb_debug PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pico-microphone/include)
+
+target_link_libraries(mic_usb_debug 
+    pico_stdlib 
+    hardware_pio     
+    pico_pdm_microphone
+    m   # <-- IMPORTANT: Links the math library required for FFT sine/cosine
+)
+
+# Force USB only
+pico_enable_stdio_usb(mic_usb_debug 1)
+pico_enable_stdio_uart(mic_usb_debug 0)
+pico_add_extra_outputs(mic_usb_debug)

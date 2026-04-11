@@ -6,6 +6,7 @@ import os
 import csv
 from datetime import datetime
 import socket
+import queue
 
 class SerialManager:
     def __init__(self, port=None, baudrate=115200):
@@ -23,6 +24,9 @@ class SerialManager:
         self.experiment_buffer = []
         self.is_recording = False
 
+        # --- THE DATA QUEUE ---
+        self.data_queue = queue.Queue()
+        
         # Start the Wi-Fi server instantly in the background when Python boots
         self.wifi_thread = threading.Thread(target=self._wifi_server_loop, daemon=True)
         self.wifi_thread.start()
@@ -67,6 +71,10 @@ class SerialManager:
         while self.is_running and self.connection_type == 'wifi':
             try:
                 data = conn.recv(1024).decode('utf-8', errors='ignore')
+                
+                if data:
+                    print(f"\r[RAW TCP] Got {len(data)} bytes: {repr(data[:30]):<30}", end="", flush=True)
+                    
                 if not data:
                     print("\n[NETWORK] Connection closed by Pico. Listening for reconnect...")
                     self.socket_conn = None
@@ -133,9 +141,12 @@ class SerialManager:
 
     def _process_line(self, line):
         if self.is_streaming:
-            # Uncomment below to see raw data in terminal (using \r so it doesn't scroll infinitely)
-            # print(f"\r--> [HARDWARE RX] {line:<30}", end="", flush=True) 
             self.latest_data = line
+            
+            # --- CRITICAL FIX: PUSH TO THE QUEUE ---
+            # Without this line, main.py starves and the React graphs freeze.
+            self.data_queue.put(line)
+            
             if self.is_recording:
                 timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 self.experiment_buffer.append(f"{timestamp},{line}")

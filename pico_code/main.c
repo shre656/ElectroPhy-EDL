@@ -46,8 +46,18 @@ bool wifi_transparent_active = false;
 #define MIC_CLK_PIN 22
 #define MIC_DAT_PIN 23
 
-#define ADDR_MPU6050 0x68
+// --- BNO055 REGISTERS ---
+#define ADDR_BNO055 0x28              // Change to 0x29 if using an alternate breakout
+#define BNO055_OPR_MODE_REG 0x3D      
+#define BNO055_MODE_NDOF 0x0C         
+#define BNO055_EULER_H_LSB_REG 0x1A
+
+// --- INA219 REGISTERS ---
 #define ADDR_INA219  0x45
+
+// ---  DSP CONSTANTS ---
+#define FFT_SIZE 256
+#define PI 3.14159265358979323846
 
 typedef struct __attribute__((packed)) {
     uint8_t opcode;
@@ -58,7 +68,12 @@ typedef struct __attribute__((packed)) {
 
 float registers[MAX_REGS];                 
 Instruction_t program[MAX_INSTRUCTIONS];   
-uint8_t program_length = 0;                
+uint8_t program_length = 0;
+
+int16_t sample_buffer[FFT_SIZE]; 
+volatile int current_mic_peak = 0;
+volatile float current_dominant_freq = 0.0f;             
+float filter_state = 0.0f;
 
 typedef enum { WAIT_SYNC, WAIT_COUNT, READ_PAYLOAD } SerialState;
 SerialState rx_state = WAIT_SYNC;
@@ -66,17 +81,123 @@ uint8_t expected_instructions = 0;
 uint8_t rx_buffer[MAX_INSTRUCTIONS * sizeof(Instruction_t)];
 uint16_t rx_index = 0;
 
-int16_t sample_buffer[256];
-volatile int current_mic_peak = 0;
+
+
+
+// ==========================================
+// DSP ALGORITHMS (DC OFFSET & FFT)
+// ==========================================
+void remove_dc_offset(int16_t *buffer, int num_samples) {
+    long sum = 0;
+    for (int i = 0; i < num_samples; i++) sum += buffer[i];
+    int16_t mean = (int16_t)(sum / num_samples);
+    for (int i = 0; i < num_samples; i++) buffer[i] -= mean;
+}
+
+void compute_fft_magnitude(int16_t* pcm_data, float* magnitudes, int n) {
+    float data_re[FFT_SIZE], data_im[FFT_SIZE];
+
+    for (int i = 0; i < n; i++) {
+        float multiplier = 0.5f * (1.0f - cos(2.0f * PI * i / (n - 1)));
+        data_re[i] = pcm_data[i] * multiplier;
+        data_im[i] = 0.0f;
+    }
+
+    int j = 0;
+    for (int i = 0; i < n - 1; i++) {
+        if (i < j) {
+            float temp_re = data_re[i], temp_im = data_im[i];
+            data_re[i] = data_re[j]; data_im[i] = data_im[j];
+            data_re[j] = temp_re; data_im[j] = temp_im;
+        }
+        int m = n / 2;
+        while (m >= 1 && j >= m) { j -= m; m /= 2; }
+        j += m;
+    }
+
+    for (int k = 1; k < n; k *= 2) {
+        float step_re = cos(-PI / k), step_im = sin(-PI / k);
+        for (int i = 0; i < n; i += 2 * k) {
+            float w_re = 1.0f, w_im = 0.0f;
+            for (int current_j = 0; current_j < k; current_j++) {
+                float u_re = data_re[i + current_j], u_im = data_im[i + current_j];
+                float v_re = data_re[i + current_j + k] * w_re - data_im[i + current_j + k] * w_im;
+                float v_im = data_re[i + current_j + k] * w_im + data_im[i + current_j + k] * w_re;
+                
+                data_re[i + current_j] = u_re + v_re;
+                data_im[i + current_j] = u_im + v_im;
+                data_re[i + current_j + k] = u_re - v_re;
+                data_im[i + current_j + k] = u_im - v_im;
+
+                float next_w_re = w_re * step_re - w_im * step_im;
+                w_im = w_re * step_im + w_im * step_re;
+                w_re = next_w_re;
+            }
+        }
+    }
+
+    for (int i = 0; i < n / 2; i++) {
+        magnitudes[i] = sqrt(data_re[i] * data_re[i] + data_im[i] * data_im[i]);
+    }
+}
 
 void on_pdm_samples_ready() {
-    int samples = pdm_microphone_read(sample_buffer, 256);
+    int samples = pdm_microphone_read(sample_buffer, FFT_SIZE);
+    
+    // 1. Clean the audio to center the wave on 0
+    remove_dc_offset(sample_buffer, samples);
+
+    float alpha = 0.25f; 
+    
+    for (int i = 0; i < samples; i++) {
+        // Smooth the current sample against the previous ones
+        filter_state = (alpha * sample_buffer[i]) + ((1.0f - alpha) * filter_state);
+        sample_buffer[i] = (int16_t)filter_state;
+    }
+
+    // ==========================================
+    // NEW: DIGITAL GAIN (SOFTWARE PRE-AMP)
+    // ==========================================
+    // Tweak this multiplier! 
+    // Start at 15. If it's still too quiet, try 30 or 50. 
+    // If it's too staticky/distorted, drop it to 5 or 10.
+    int gain_multiplier = 5; 
+    
+    for (int i = 0; i < samples; i++) {
+        int32_t boosted = (int32_t)sample_buffer[i] * gain_multiplier;
+        
+        // Hard-clipping to prevent 16-bit integer overflow
+        if (boosted > 32767) boosted = 32767;
+        else if (boosted < -32768) boosted = -32768;
+        
+        sample_buffer[i] = (int16_t)boosted;
+    }
+    // ==========================================
+
+    // 2. Calculate Peak Volume (Now using the boosted audio)
     int local_peak = 0;
     for (int i = 0; i < samples; i++) {
         int amplitude = abs(sample_buffer[i]);
         if (amplitude > local_peak) local_peak = amplitude;
     }
     current_mic_peak = local_peak;
+
+    // 3. Run FFT and find the Dominant Frequency (Now using the boosted audio)
+    float magnitudes[FFT_SIZE / 2];
+    compute_fft_magnitude(sample_buffer, magnitudes, FFT_SIZE);
+
+    float max_mag = 0;
+    int dominant_bin = 0;
+    
+    // Start at bin 1 to ignore DC offset
+    for (int i = 1; i < FFT_SIZE / 2; i++) { 
+        if (magnitudes[i] > max_mag) {
+            max_mag = magnitudes[i];
+            dominant_bin = i;
+        }
+    }
+    
+    current_dominant_freq = (float)dominant_bin * (16000.0f / FFT_SIZE);
 }
 
 // ==========================================
@@ -189,15 +310,17 @@ void setup_hardware() {
         printf("\n[FALLBACK] Wi-Fi failed. Running in USB-only mode.\n");
     }
 
-    // 2. I2C Sensors
-    i2c_init(I2C_PORT, 400 * 1000);
+    /// 2. I2C Sensors (BNO055 & INA219)
+    i2c_init(I2C_PORT, 100 * 1000); // FIXED: 100kHz for BNO055 stability
     gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(SDA_PIN);
     gpio_pull_up(SCL_PIN);
 
-    uint8_t wake_cmd[] = {0x6B, 0x00};
-    i2c_write_blocking(I2C_PORT, ADDR_MPU6050, wake_cmd, 2, false);
+    // Boot BNO055 into NDOF Fusion Mode
+    uint8_t mode_cmd[] = {BNO055_OPR_MODE_REG, BNO055_MODE_NDOF};
+    i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, mode_cmd, 2, false, 25000);
+    sleep_ms(50); // Give the ARM Cortex-M0 time to start
 
     // 3. LDR ADC
     adc_init();
@@ -240,16 +363,23 @@ int main() {
                 switch (inst->opcode) {
                     
                     case 0x01: { 
-                        uint8_t reg = 0x3B; 
-                        uint8_t data[14]; 
-                        if (i2c_write_timeout_us(I2C_PORT, ADDR_MPU6050, &reg, 1, true, 5000) > 0) {
-                            i2c_read_timeout_us(I2C_PORT, ADDR_MPU6050, data, 14, false, 5000);
-                            if (inst->out_regs[0] != 255) registers[inst->out_regs[0]] = (int16_t)((data[0] << 8) | data[1]) / 16384.0f;
-                            if (inst->out_regs[1] != 255) registers[inst->out_regs[1]] = (int16_t)((data[2] << 8) | data[3]) / 16384.0f;
-                            if (inst->out_regs[2] != 255) registers[inst->out_regs[2]] = (int16_t)((data[4] << 8) | data[5]) / 16384.0f;
-                            if (inst->out_regs[3] != 255) registers[inst->out_regs[3]] = (int16_t)((data[8] << 8) | data[9]) / 131.0f;
-                            if (inst->out_regs[4] != 255) registers[inst->out_regs[4]] = (int16_t)((data[10] << 8) | data[11]) / 131.0f;
-                            if (inst->out_regs[5] != 255) registers[inst->out_regs[5]] = (int16_t)((data[12] << 8) | data[13]) / 131.0f;
+                        // --- UPDATED FOR BNO055 ---
+                        uint8_t reg = BNO055_EULER_H_LSB_REG; 
+                        uint8_t data[6] = {0, 0, 0, 0, 0, 0}; 
+                        
+                        if (i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, &reg, 1, true, 5000) > 0) {
+                            sleep_us(50); // Clock stretch buffer
+                            if (i2c_read_timeout_us(I2C_PORT, ADDR_BNO055, data, 6, false, 5000) > 0) {
+                                // Little-Endian Math, direct to degrees (/16)
+                                if (inst->out_regs[0] != 255) registers[inst->out_regs[0]] = (int16_t)((data[1] << 8) | data[0]) / 16.0f; // Heading
+                                if (inst->out_regs[1] != 255) registers[inst->out_regs[1]] = (int16_t)((data[3] << 8) | data[2]) / 16.0f; // Roll
+                                if (inst->out_regs[2] != 255) registers[inst->out_regs[2]] = (int16_t)((data[5] << 8) | data[4]) / 16.0f; // Pitch
+                                
+                                // Clear unused outputs (previously Gyro data on MPU)
+                                if (inst->out_regs[3] != 255) registers[inst->out_regs[3]] = 0.0f;
+                                if (inst->out_regs[4] != 255) registers[inst->out_regs[4]] = 0.0f;
+                                if (inst->out_regs[5] != 255) registers[inst->out_regs[5]] = 0.0f;
+                            }
                         }
                         break;
                     }
@@ -274,11 +404,17 @@ int main() {
                     }
 
                     case 0x04: {
+                        // Register 0: The Volume Peak
                         if (inst->out_regs[0] != 255) {
                             registers[inst->out_regs[0]] = (float)current_mic_peak;
                         }
+                        // Register 1: The Dominant Frequency (Hz)
+                        if (inst->out_regs[1] != 255) {
+                            registers[inst->out_regs[1]] = current_dominant_freq;
+                        }
                         break;
                     }
+                    
 
                     case 0x10: { 
                         if (inst->in_regs[0] != 255 && inst->out_regs[0] != 255) {

@@ -228,25 +228,32 @@ def compile_graph_to_bytecode(nodes, edges):
 
 @app.post("/api/experiment/compile")
 def compile_experiment(payload: GraphPayload):
-    if not hardware.is_running:
-        raise HTTPException(status_code=400, detail="Hardware not connected")
-
-    # PRE-COMPILE SAFETY FLUSH: Pause stream and clear previous math states
+    if not hardware.is_running: raise HTTPException(status_code=400, detail="Hardware not connected")
+    
+    # 1. Turn OFF stream during compile
     hardware.is_streaming = False 
     node_state_memory.clear()     
     hardware.latest_data = None   
 
     try:
         binary_data = compile_graph_to_bytecode(payload.nodes, payload.edges)
-        hardware.send_command(binary_data)
-        print(f"Graph Compiled. Sent {len(binary_data)} bytes to Pico.")
+        
+        import time
+        for byte in binary_data:
+            hardware.send_command(bytes([byte]))
+            time.sleep(0.01) 
+        
+        # 2. TURN IT BACK ON!!! (This is what was missing)
+        hardware.is_streaming = True
+        
+        print(f"\n[COMPILER] Graph Deployed. Trickle-fed {len(binary_data)} bytes via Wi-Fi.")
         return {"status": "compiled", "bytes_sent": len(binary_data)}
         
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal compiler failure")
-
+    
 # ==========================================
 # REAL-TIME DATA ENGINE
 # ==========================================
@@ -257,135 +264,129 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     global node_state_memory
     node_state_memory.clear() 
-    print("[WEBSOCKET] React UI Connected successfully.")
+    print("\n[WEBSOCKET] React UI Connected. Listening for live data...")
     
     try:
         while True:
-            if hardware.is_running and hardware.latest_data is not None:
-                
-                raw_string = hardware.latest_data
-                hardware.latest_data = None 
-                
-                # --- NEW DEBUG PRINT: See exactly what the Pico sent ---
-                # print(f"\r[DEBUG RAW RX] '{raw_string}'")
-                
-                if "[DEBUG]" not in raw_string:
-                    clean_data = raw_string.replace("--> [HARDWARE RX]", "").strip()
+            plots_to_send = None
+            frames_processed = 0
+            
+            # Drain queue safely (max 20 frames per tick to prevent blocking)
+            while hardware.is_running and not hardware.data_queue.empty():
+                try:
+                    raw_string = hardware.data_queue.get_nowait()
                     
-                    if clean_data:
-                        try:
-                            try:
-                                hw_vals = [float(x) for x in clean_data.split(',')]
-                            except ValueError:
-                                hw_vals = []
+                    # Keep terminal alive so you know data is arriving
+                    print(f"\r[DATA TICK] {raw_string[:40]:<40}", end="", flush=True)
+                    
+                    if "[DEBUG]" not in raw_string:
+                        clean_data = raw_string.replace("--> [HARDWARE RX]", "").strip()
+                        
+                        # --- THE REAL FIX: BULLETPROOF NUMBER EXTRACTION ---
+                        # This ignores all Wi-Fi null bytes (\x00), carriage returns, and garbage.
+                        import re
+                        numbers = re.findall(r'-?\d+\.\d+|-?\d+', clean_data)
+                        hw_vals = [float(x) for x in numbers]
 
-                            if pc_pipeline_state["nodes"] and hw_vals:
-                                node_state = {}
-                                plots_to_send = {}
-                                
-                                for n in pc_pipeline_state["nodes"]:
-                                    if n["op"] == "transport_in":
-                                        node_state[n["id"]] = hw_vals
-                                
-                                time_plot_count = 1
+                        if pc_pipeline_state["nodes"] and hw_vals:
+                            node_state = {}
+                            frame_plots = {}
+                            
+                            # 1. FUZZY MATCH: Find any node acting as "RX"
+                            for n in pc_pipeline_state["nodes"]:
+                                op_str = str(n["op"]).lower()
+                                if "transport" in op_str or "rx" in op_str or "in" in op_str:
+                                    node_state[n["id"]] = hw_vals
+                            
+                            time_plot_count = 1
+                            for n in pc_pipeline_state["nodes"]:
+                                nid, op_str = n["id"], str(n["op"]).lower()
+                                if "transport" in op_str or "rx" in op_str: continue
+                                if nid not in node_state_memory: node_state_memory[nid] = {}
 
-                                for n in pc_pipeline_state["nodes"]:
-                                    nid = n["id"]
-                                    op = n["op"]
-                                    if op == "transport_in": continue
+                                inputs = {} 
+                                for w in pc_pipeline_state["wires"]:
+                                    if w["target"] == nid:
+                                        src_idx, tgt_idx = get_pin_index(w["sourceHandle"]), get_pin_index(w["targetHandle"])
+                                        src_data = node_state.get(w["source"], [])
+                                        inputs[tgt_idx] = src_data[src_idx] if src_idx < len(src_data) else 0.0
 
-                                    if nid not in node_state_memory:
-                                        node_state_memory[nid] = {}
+                                node_state[nid] = [0.0] * 6 
 
-                                    inputs = {} 
-                                    for w in pc_pipeline_state["wires"]:
-                                        if w["target"] == nid:
-                                            src_idx = get_pin_index(w["sourceHandle"])
-                                            tgt_idx = get_pin_index(w["targetHandle"])
-                                            
-                                            src_data = node_state.get(w["source"], [])
-                                            val = src_data[src_idx] if src_idx < len(src_data) else 0.0
-                                            inputs[tgt_idx] = val
-
-                                    node_state[nid] = [0.0] * 6 
-
-                                    # --- DSP MATH OPERATIONS ---
-                                    if op == "math_mag":
-                                        x, y, z = inputs.get(0, 0.0), inputs.get(1, 0.0), inputs.get(2, 0.0)
-                                        node_state[nid][0] = math.sqrt(x*x + y*y + z*z)
-
-                                    elif op == "math_add":
-                                        try: const = float(n["params"].get("threshold", 0.0))
-                                        except ValueError: const = 0.0
-                                        node_state[nid][0] = inputs.get(0, 0.0) + const
-
-                                    elif op == "math_hpf":
-                                        in_val = inputs.get(0, 0.0)
-                                        try: fc = float(n["params"].get("threshold", 2.0))
-                                        except ValueError: fc = 2.0
-                                        dt = 0.01 
-                                        rc = 1.0 / (2 * math.pi * fc) if fc > 0 else 1.0
-                                        alpha = rc / (rc + dt)
-                                        x_prev = node_state_memory[nid].get("x_prev", in_val)
-                                        y_prev = node_state_memory[nid].get("y_prev", 0.0)
-                                        y = alpha * (y_prev + in_val - x_prev)
-                                        node_state_memory[nid]["x_prev"] = in_val
-                                        node_state_memory[nid]["y_prev"] = y
-                                        node_state[nid][0] = y
+                                # --- DSP MATH OPERATIONS ---
+                                if "mag" in op_str: 
+                                    node_state[nid][0] = math.sqrt(inputs.get(0, 0)**2 + inputs.get(1, 0)**2 + inputs.get(2, 0)**2)
+                                elif "add" in op_str: 
+                                    node_state[nid][0] = inputs.get(0, 0.0) + float(n["params"].get("threshold", 0.0))
+                                elif "hpf" in op_str:
+                                    in_val = inputs.get(0, 0.0)
+                                    try: fc = float(n["params"].get("threshold", 2.0))
+                                    except ValueError: fc = 2.0
+                                    dt = 0.01 
+                                    rc = 1.0 / (2 * math.pi * fc) if fc > 0 else 1.0
+                                    alpha = rc / (rc + dt)
+                                    x_prev = node_state_memory[nid].get("x_prev", in_val)
+                                    y_prev = node_state_memory[nid].get("y_prev", 0.0)
+                                    y = alpha * (y_prev + in_val - x_prev)
+                                    node_state_memory[nid]["x_prev"] = in_val
+                                    node_state_memory[nid]["y_prev"] = y
+                                    node_state[nid][0] = y
+                                elif "lpf" in op_str:
+                                    in_val = inputs.get(0, 0.0)
+                                    try: fc = float(n["params"].get("threshold", 5.0)) 
+                                    except ValueError: fc = 5.0
+                                    dt = 0.01 
+                                    rc = 1.0 / (2 * math.pi * fc) if fc > 0 else 1.0
+                                    alpha = dt / (rc + dt)
+                                    y_prev = node_state_memory[nid].get("y_prev", in_val)
+                                    y = y_prev + alpha * (in_val - y_prev)
+                                    node_state_memory[nid]["y_prev"] = y
+                                    node_state[nid][0] = y
+                                elif "fft" in op_str:
+                                    in_val = inputs.get(0, 0.0)
+                                    if "buffer" not in node_state_memory[nid]:
+                                        node_state_memory[nid]["buffer"] = [] 
+                                    node_state_memory[nid]["buffer"].append(in_val)
+                                    if len(node_state_memory[nid]["buffer"]) >= 64:
+                                        fft_data = np.abs(np.fft.rfft(node_state_memory[nid]["buffer"]))
+                                        fft_data[0] = 0.0 
+                                        node_state[nid][0] = fft_data.tolist()
+                                        node_state_memory[nid]["buffer"].clear()
+                                    else:
+                                        node_state[nid][0] = []
                                         
-                                    elif op == "math_lpf":
-                                        in_val = inputs.get(0, 0.0)
-                                        try: fc = float(n["params"].get("threshold", 5.0)) 
-                                        except ValueError: fc = 5.0
-                                        dt = 0.01 
-                                        rc = 1.0 / (2 * math.pi * fc) if fc > 0 else 1.0
-                                        alpha = dt / (rc + dt)
-                                        y_prev = node_state_memory[nid].get("y_prev", in_val)
-                                        y = y_prev + alpha * (in_val - y_prev)
-                                        node_state_memory[nid]["y_prev"] = y
-                                        node_state[nid][0] = y
+                                # --- PLOT ROUTING ---
+                                elif "plot" in op_str and "freq" not in op_str:
+                                    traces = [inputs[i] for i in range(6) if i in inputs]
+                                    if traces:
+                                        frame_plots[nid] = {"type": "time", "title": f"TIME SERIES {time_plot_count}", "data": traces}
+                                        time_plot_count += 1
+                                        
+                                elif "freq" in op_str:
+                                    if isinstance(inputs.get(0, []), list) and len(inputs.get(0, [])) > 0:
+                                        frame_plots[nid] = {"type": "freq", "title": "FREQUENCY SPECTRUM", "data": inputs.get(0, [])}
+                                        
+                            if frame_plots:
+                                plots_to_send = frame_plots # Overwrite with the latest frame
+                                
+                except Exception as e:
+                    # If math completely fails, print it so we actually see the bug!
+                    if "ClientDisconnected" not in str(e) and "close message" not in str(e):
+                        print(f"\n[PARSE ERROR] Dropped frame: {e} | Raw Data: {repr(raw_string)}")
 
-                                    elif op == "math_fft":
-                                        in_val = inputs.get(0, 0.0)
-                                        if "buffer" not in node_state_memory[nid]:
-                                            node_state_memory[nid]["buffer"] = [] 
-                                        node_state_memory[nid]["buffer"].append(in_val)
-                                        if len(node_state_memory[nid]["buffer"]) >= 64:
-                                            fft_data = np.abs(np.fft.rfft(node_state_memory[nid]["buffer"]))
-                                            fft_data[0] = 0.0 
-                                            node_state[nid][0] = fft_data.tolist()
-                                            node_state_memory[nid]["buffer"].clear()
-                                        else:
-                                            node_state[nid][0] = []
+                frames_processed += 1
+                if frames_processed > 20: 
+                    break # Safety exit to prevent async lockup
+            
+            # Send ONLY the latest batched frame to React (fixes the UI freeze)
+            if plots_to_send:
+                await websocket.send_text(json.dumps(plots_to_send))
 
-                                    # --- PLOT ROUTING ---
-                                    elif op == "plot":
-                                        traces = [inputs[i] for i in range(4) if i in inputs]
-                                        if traces:
-                                            plots_to_send[nid] = {"type": "time", "title": f"TIME SERIES {time_plot_count}", "data": traces}
-                                            time_plot_count += 1
-                                            
-                                    elif op == "plot_freq":
-                                        freq_data = inputs.get(0, [])
-                                        if isinstance(freq_data, list) and len(freq_data) > 0:
-                                            plots_to_send[nid] = {"type": "freq", "title": "FREQUENCY SPECTRUM", "data": freq_data}
-                                            
-                                if plots_to_send:
-                                    await websocket.send_text(json.dumps(plots_to_send))
-
-                        except RuntimeError as re:
-                            if "close message" in str(re):
-                                break 
-                            print(f"[PIPELINE ERROR] Dropping frame. Reason: {repr(re)}")
-                        except Exception as e:
-                            # --- NEW DEBUG TRACE: Shows exact line number of crash ---
-                            print(f"\n[PIPELINE CRASH] Data: {clean_data}")
-                            traceback.print_exc() 
-
-            await asyncio.sleep(0.01)
+            # Enforce 50 FPS max to keep React UI buttery smooth and prevent lockups
+            await asyncio.sleep(0.02) 
             
     except WebSocketDisconnect:
         print("\n[WEBSOCKET] React UI Disconnected!")
-        
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

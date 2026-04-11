@@ -27,6 +27,8 @@
 #define MIC_CLK_PIN 22
 #define MIC_DAT_PIN 23
 
+
+
 // --- WiFi/ESP12F PIO Pins ---
 #define WIFI_TX_PIN 0
 #define WIFI_RX_PIN 1
@@ -40,6 +42,11 @@
 #define MPU6050_PWR_MGMT_1   0x6B
 #define MPU6050_ACCEL_XOUT_H 0x3B
 
+#define ADDR_BNO055 0x28              // BNO055 default I2C address (can be 0x29 on some breakout boards)
+#define BNO055_OPR_MODE_REG 0x3D      // Operating mode register
+#define BNO055_MODE_NDOF 0x0C         // 9-DOF Sensor Fusion Mode
+#define BNO055_EULER_H_LSB_REG 0x1A   // Start of Euler angles (Heading/Yaw)
+
 // --- Global PIO Variables for Wi-Fi ---
 PIO pio_inst = pio0;
 uint sm_t, sm_r;
@@ -51,8 +58,8 @@ int wgetchar(uint32_t timeout_us);
 bool init_wifi_transparent();
 bool send_at_cmd(const char* cmd, const char* expected, uint32_t timeout_ms);
 
-void run_i2c_scan();
-void test_mpu6050();
+void scan_i2c_bus();
+void test_bno055();
 void test_ina219();
 void test_ldr();
 void test_microphone();
@@ -136,8 +143,8 @@ int main() {
         int choice = wgetchar(0xFFFFFFFF);
 
         switch(choice) {
-            case '1': run_i2c_scan();    break;
-            case '2': test_mpu6050();    break;
+            case '1': scan_i2c_bus();    break;
+            case '2': test_bno055();    break;
             case '3': test_ina219();     break;
             case '4': test_ldr();        break;
             case '5': test_microphone(); break;
@@ -239,49 +246,98 @@ bool init_wifi_transparent() {
 // SENSOR TEST ROUTINES
 // ==========================================
 
-void run_i2c_scan() {
-    wprintf("\n--- SCANNING I2C BUS ---\n");
-    int devices = 0;
-    uint8_t rxdata;
-    for (int addr = 0; addr < 128; ++addr) {
-        if ((addr & 0x78) == 0 || (addr & 0x78) == 0x78) continue;
-        if (i2c_read_timeout_us(I2C_PORT, addr, &rxdata, 1, false, 25000) >= 0) {
-            devices++;
-            wprintf("Found device at 0x%02X\n", addr);
+void scan_i2c_bus() {
+    wprintf("\n--- AGGRESSIVE I2C BUS SCAN ---\n");
+    
+    // 1. Force the bus to a safe 100kHz speed (BNO055 hates 400kHz)
+    uint baud = i2c_init(I2C_PORT, 100 * 1000);
+    wprintf("[DEBUG] I2C Baudrate reset to: %d Hz\n", baud);
+    
+    // 2. Force internal pull-up resistors (Critical if you don't have physical ones)
+    // NOTE: Replace 4 and 5 below with whatever your actual SDA and SCL pin numbers are!
+    gpio_pull_up(4); // SDA Pin
+    gpio_pull_up(5); // SCL Pin
+    wprintf("[DEBUG] Internal Pull-ups enabled.\n");
+    wprintf("[DEBUG] Searching all 127 addresses with 10ms timeouts...\n\n");
+
+    int count = 0;
+    for (int addr = 1; addr < 128; ++addr) {
+        uint8_t rxdata;
+        // Using timeout so a locked bus doesn't freeze the scan
+        int ret = i2c_read_timeout_us(I2C_PORT, addr, &rxdata, 1, false, 10000);
+        
+        if (ret >= 0) {
+            wprintf("[SUCCESS] Found device at 0x%02X!\n", addr);
+            count++;
+        } else if (ret == PICO_ERROR_GENERIC) {
+            // This just means "nobody answered", perfectly normal for empty addresses
+        } else if (ret == PICO_ERROR_TIMEOUT) {
+            wprintf("[WARNING] Address 0x%02X stretched the clock and timed out!\n", addr);
         }
     }
-    if (devices == 0) wprintf("No devices found.\n");
-    else              wprintf("Scan complete. %d device(s) found.\n", devices);
+    
+    if (count == 0) {
+        wprintf("\n[RESULT] 0 devices found. Check wiring and pin numbers!\n");
+    } else {
+        wprintf("\n[RESULT] Scan complete. Found %d devices.\n", count);
+    }
 }
 
-void test_mpu6050() {
-    wprintf("\n--- STREAMING MPU-6050 ---\n");
+void test_bno055() {
+    wprintf("\n--- STREAMING BNO055 FUSION DATA ---\n");
 
-    // Wake the MPU-6050 from sleep
-    uint8_t wake_cmd[] = {MPU6050_PWR_MGMT_1, 0x00};
-    i2c_write_timeout_us(I2C_PORT, ADDR_MPU6050, wake_cmd, 2, false, 25000);
-    sleep_ms(100);
+    // 1. Put into NDOF Mode
+    uint8_t mode_cmd[] = {BNO055_OPR_MODE_REG, BNO055_MODE_NDOF};
+    int w_ret = i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, mode_cmd, 2, false, 25000);
+    
+    if (w_ret < 0) {
+        wprintf("[ERROR] BNO055 not found at 0x%02X! Is the address 0x29?\n", ADDR_BNO055);
+        return;
+    }
 
-    // FIX 1: Throw away the leftover "Enter" key from the menu selection
+    // Give the BNO055 fusion engine 100ms to boot up
+    sleep_ms(100); 
+
+    // Flush leftover terminal keys
     while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
-
     wprintf("Press ANY key in terminal to stop stream...\n\n");
 
     while (wgetchar(0) == PICO_ERROR_TIMEOUT) {
-        uint8_t accel_reg = MPU6050_ACCEL_XOUT_H;
-        uint8_t buffer[6];
-        i2c_write_timeout_us(I2C_PORT, ADDR_MPU6050, &accel_reg, 1, true, 25000);
-        i2c_read_timeout_us(I2C_PORT, ADDR_MPU6050, buffer, 6, false, 25000);
+        uint8_t reg = BNO055_EULER_H_LSB_REG;
+        
+        // FIX 1: Force the array to be all zeros so we NEVER print RAM garbage!
+        uint8_t buffer[6] = {0, 0, 0, 0, 0, 0}; 
+        
+        // Tell the BNO055 which register we want to read
+        int write_success = i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, &reg, 1, true, 25000);
+        
+        // FIX 2: The BNO055 needs a microsecond to breathe before coughing up the data
+        sleep_us(50); 
+        
+        // Read the 6 bytes
+        int read_success = i2c_read_timeout_us(I2C_PORT, ADDR_BNO055, buffer, 6, false, 25000);
 
-        float ax = (int16_t)((buffer[0] << 8) | buffer[1]) / 16384.0f;
-        float ay = (int16_t)((buffer[2] << 8) | buffer[3]) / 16384.0f;
-        float az = (int16_t)((buffer[4] << 8) | buffer[5]) / 16384.0f;
+        // FIX 3: If the sensor drops a packet, ignore it and try again instead of freezing!
+        if (write_success < 0 || read_success < 0) {
+            wprintf("\r[I2C WARNING] Packet dropped. Re-syncing...         ");
+            sleep_ms(50);
+            continue; 
+        }
 
-        // FIX 2: Added \n at the end to force the Mac Terminal to print it!
-        wprintf("Ax: %6.2f g | Ay: %6.2f g | Az: %6.2f g\n", ax, ay, az); 
-        sleep_ms(100);
+        // Calculate degrees
+        float heading = (int16_t)((buffer[1] << 8) | buffer[0]) / 16.0f;
+        float roll    = (int16_t)((buffer[3] << 8) | buffer[2]) / 16.0f;
+        float pitch   = (int16_t)((buffer[5] << 8) | buffer[4]) / 16.0f;
+
+        wprintf("\rHeading: %6.2f | Roll: %6.2f | Pitch: %6.2f       ", heading, roll, pitch); 
+        sleep_ms(50); // 20Hz refresh
     }
-    wprintf("\nMPU Stream Stopped.\n");
+    
+    // Put sensor to sleep
+    uint8_t sleep_cmd[] = {BNO055_OPR_MODE_REG, 0x00};
+    i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, sleep_cmd, 2, false, 25000);
+    
+    wprintf("\n\nBNO055 Stream Stopped.\n");
 }
 
 void test_ina219() {
