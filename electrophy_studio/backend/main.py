@@ -1,3 +1,6 @@
+from random import random
+from time import time
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
@@ -318,6 +321,14 @@ async def websocket_endpoint(websocket: WebSocket):
                                     node_state[nid][0] = math.sqrt(inputs.get(0, 0)**2 + inputs.get(1, 0)**2 + inputs.get(2, 0)**2)
                                 elif "add" in op_str: 
                                     node_state[nid][0] = inputs.get(0, 0.0) + float(n["params"].get("threshold", 0.0))
+                                # --- NEW MULTIPLICATION BLOCK ---
+                                elif "mul" in op_str:
+                                    try: 
+                                        multiplier = float(n["params"].get("threshold", 1.0))
+                                    except ValueError: 
+                                        multiplier = 1.0
+                                    node_state[nid][0] = inputs.get(0, 0.0) * multiplier
+                                # --------------------------------
                                 elif "hpf" in op_str:
                                     in_val = inputs.get(0, 0.0)
                                     try: fc = float(n["params"].get("threshold", 2.0))
@@ -354,6 +365,35 @@ async def websocket_endpoint(websocket: WebSocket):
                                         node_state_memory[nid]["buffer"].clear()
                                     else:
                                         node_state[nid][0] = []
+                                        
+                                # --- SYNTHETIC DATA GENERATORS ---
+                                elif "source_sine" in op_str:
+                                    # Use the UI input box to set noise level (defaults to 0.1)
+                                    try: noise_amp = float(n.get("params", {}).get("threshold", 0.1))
+                                    except ValueError: noise_amp = 0.1
+                                    
+                                    t = time.time()
+                                    # Generates a 1Hz sine wave + random noise
+                                    val = math.sin(t * 2 * math.pi) + random.uniform(-noise_amp, noise_amp)
+                                    node_state[nid][0] = val
+
+                                elif "source_rc" in op_str:
+                                    try: noise_amp = float(n.get("params", {}).get("threshold", 0.05))
+                                    except ValueError: noise_amp = 0.05
+                                    
+                                    # Modulo 5 creates a looping 5-second RC charge curve
+                                    t = time.time() % 5.0 
+                                    # Standard RC capacitor charge equation (aiming for 3.3V)
+                                    val = 3.3 * (1.0 - math.exp(-t / 1.0)) + random.uniform(-noise_amp, noise_amp)
+                                    node_state[nid][0] = val
+
+                                # --- SCATTER PLOT ROUTING ---
+                                elif "plot_scatter" in op_str:
+                                    x_val = inputs.get(0, 0.0)
+                                    y_val = inputs.get(1, 0.0)
+                                    # We send it as a special "scatter" type so React knows how to render it
+                                    frame_plots[nid] = {"type": "scatter", "title": "X/Y SCATTER", "data": [x_val, y_val]}
+                                    
                                         
                                 # --- PLOT ROUTING ---
                                 elif "plot" in op_str and "freq" not in op_str:

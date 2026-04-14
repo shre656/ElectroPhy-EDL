@@ -24,14 +24,20 @@ const LiveGraph = ({ theme, isDarkMode }) => {
     .then(() => setIsStreaming(false))
     .catch(err => console.error("Failed to stop stream", err));
 
+  // [FIX 1] Update layout dynamically for BOTH Time and Scatter plots when range changes
   useEffect(() => {
     Object.keys(plotRefs.current).forEach(id => {
       const pState = plotRefs.current[id];
-      if (pState && pState.type === 'time') {
-        const layoutUpdate = yRange === 'auto' 
-          ? { 'yaxis.autorange': true } 
-          : { 'yaxis.range': [-Number(yRange), Number(yRange)] };
-        Plotly.relayout(`plot-${id}`, layoutUpdate);
+      if (pState) {
+        let layoutUpdate = {};
+        if (yRange === 'auto') {
+          layoutUpdate = { 'yaxis.autorange': true };
+          if (pState.type === 'scatter') layoutUpdate['xaxis.autorange'] = true;
+        } else {
+          layoutUpdate = { 'yaxis.range': [-Number(yRange), Number(yRange)] };
+          if (pState.type === 'scatter') layoutUpdate['xaxis.range'] = [-Number(yRange), Number(yRange)];
+        }
+        Plotly.relayout(`plot-${id}`, layoutUpdate).catch(()=>console.log("Plotly relayout skipped"));
       }
     });
   }, [yRange]);
@@ -68,12 +74,16 @@ const LiveGraph = ({ theme, isDarkMode }) => {
           }
 
           if (pData.type === 'time') {
-            // FIXED: X-axis counter bug
             const currentX = xCounter.current++;
             dataBuffer.current[plotId].pendingX.push(currentX);
             dataBuffer.current[plotId].pendingY.push(pData.data);
           } else if (pData.type === 'freq') {
             dataBuffer.current[plotId].latestFreq = pData.data; 
+          } 
+          // [FIX 2] Parse incoming Scatter Data [x_val, y_val]
+          else if (pData.type === 'scatter') {
+            dataBuffer.current[plotId].pendingX.push(pData.data[0]);
+            dataBuffer.current[plotId].pendingY.push(pData.data[1]);
           }
         });
 
@@ -98,13 +108,11 @@ const LiveGraph = ({ theme, isDarkMode }) => {
         const graphDiv = document.getElementById(divId);
         if (!graphDiv) return;
 
-        // NEW: Try/Catch around Plotly ensures the render loop never dies
         try {
           // --- TIME SERIES ---
           if (buffer.type === 'time' && buffer.pendingY.length > 0) {
             const currentNumTraces = buffer.pendingY[0].length;
 
-            // NEW: Self-Healing Logic! If you unplugged a wire, wipe the graph and restart it.
             if (pState.initialized && graphDiv.data && graphDiv.data.length !== currentNumTraces) {
               Plotly.purge(divId);
               pState.initialized = false;
@@ -124,9 +132,7 @@ const LiveGraph = ({ theme, isDarkMode }) => {
               const updateY = Array.from({length: currentNumTraces}, () => []);
               
               buffer.pendingY.forEach((valArray, rowIndex) => {
-                // Ignore weird frames during compiler transitions
                 if (valArray.length !== currentNumTraces) return; 
-
                 valArray.forEach((val, traceIndex) => {
                   updateX[traceIndex].push(buffer.pendingX[rowIndex]);
                   updateY[traceIndex].push(val);
@@ -143,7 +149,7 @@ const LiveGraph = ({ theme, isDarkMode }) => {
           // --- FFT / FREQUENCY ---
           if (buffer.type === 'freq' && buffer.latestFreq) {
             const freqs = Array.from({length: buffer.latestFreq.length}, (_, i) => i);
-            const trace = { x: freqs, y: buffer.latestFreq, type: 'bar', marker: { color: theme.accent }, hoverinfo: 'none' };
+            const trace = { x: freqs, y: buffer.latestFreq, type: 'bar', marker: { color: theme.accent || traceColors[0] }, hoverinfo: 'none' };
             const fftLayout = { ...defaultLayout, title: buffer.title, yaxis: { ...defaultLayout.yaxis, range: [0, 50] } };
 
             if (!pState.initialized) {
@@ -154,8 +160,38 @@ const LiveGraph = ({ theme, isDarkMode }) => {
             }
             buffer.latestFreq = null; 
           }
+
+          // [FIX 3] --- X/Y SCATTER PLOT ROUTING ---
+          if (buffer.type === 'scatter' && buffer.pendingX.length > 0) {
+            if (!pState.initialized) {
+              const trace = {
+                x: [], y: [], type: 'scatter', mode: 'lines+markers',
+                marker: { color: traceColors[1], size: 4 },
+                line: { color: traceColors[1], width: 1.5 },
+                hoverinfo: 'none'
+              };
+              
+              const xyAxis = yRange === 'auto' 
+                ? { autorange: true } 
+                : { range: [-Number(yRange), Number(yRange)] };
+
+              // scaleanchor locks the aspect ratio to 1:1, so a circle doesn't stretch into an oval
+              const scatterLayout = { 
+                ...defaultLayout, 
+                title: buffer.title,
+                xaxis: { ...defaultLayout.xaxis, ...xyAxis },
+                yaxis: { ...defaultLayout.yaxis, ...xyAxis, scaleanchor: 'x', scaleratio: 1 } 
+              };
+
+              Plotly.newPlot(divId, [trace], scatterLayout, { staticPlot: true });
+              pState.initialized = true;
+            } else {
+              Plotly.extendTraces(divId, { x: [buffer.pendingX], y: [buffer.pendingY] }, [0], MAX_POINTS);
+            }
+            buffer.pendingX = []; buffer.pendingY = [];
+          }
+
         } catch (err) {
-           // If Plotly still somehow errors out, flag it to re-initialize next frame
            pState.initialized = false;
            buffer.pendingX = []; buffer.pendingY = [];
         }

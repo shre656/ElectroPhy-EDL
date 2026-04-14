@@ -8,11 +8,14 @@
 #include "hardware/pio.h"
 #include "uart_tx.pio.h"
 #include "uart_rx.pio.h"
-#include "pico/pdm_microphone.h"
+extern "C" {
+    #include "pico/pdm_microphone.h"
+}
 #include <stdlib.h> // For abs()
+#include "VL53L0X.h"
 
 // ==========================================
-// 🛑 CHANGE THESE TO YOUR 2.4GHz HOTSPOT DETAILS!
+// CHANGE THESE TO YOUR 2.4GHz HOTSPOT DETAILS!
 // ==========================================
 #define WIFI_SSID "Karthik's Hotspot"
 #define WIFI_PASS "mera hai"
@@ -26,8 +29,6 @@
 #define SCL_PIN 3
 #define MIC_CLK_PIN 22
 #define MIC_DAT_PIN 23
-
-
 
 // --- WiFi/ESP12F PIO Pins ---
 #define WIFI_TX_PIN 0
@@ -47,6 +48,12 @@
 #define BNO055_MODE_NDOF 0x0C         // 9-DOF Sensor Fusion Mode
 #define BNO055_EULER_H_LSB_REG 0x1A   // Start of Euler angles (Heading/Yaw)
 
+// --- ToF Sensor Settings ---
+// Note: 0x29 is the default for VL53L0X/VL53L1X. 
+// 0x10 is common for TF-Luna. Adjust accordingly.
+#define ADDR_TOF 0x29                 
+#define TOF_DIST_REG 0x1E             // Placeholder register (varies heavily by ToF model)
+
 // --- Global PIO Variables for Wi-Fi ---
 PIO pio_inst = pio0;
 uint sm_t, sm_r;
@@ -63,6 +70,7 @@ void test_bno055();
 void test_ina219();
 void test_ldr();
 void test_microphone();
+void test_tof(); // Added ToF Prototype
 
 // ==========================================
 // CUSTOM WI-FI I/O FUNCTIONS
@@ -138,16 +146,18 @@ int main() {
         wprintf("3. Stream INA219 (Power Monitor)\n");
         wprintf("4. Stream LDR (Light Sensor)\n");
         wprintf("5. Stream SPH064 Microphone (PDM)\n");
+        wprintf("6. Stream ToF (Distance Sensor)\n"); // Added ToF Option
         wprintf("> ");
 
         int choice = wgetchar(0xFFFFFFFF);
 
         switch(choice) {
             case '1': scan_i2c_bus();    break;
-            case '2': test_bno055();    break;
+            case '2': test_bno055();     break;
             case '3': test_ina219();     break;
             case '4': test_ldr();        break;
             case '5': test_microphone(); break;
+            case '6': test_tof();        break; // Added ToF Case
             case '\r':
             case '\n': break;
             default: wprintf("\nInvalid selection.\n");
@@ -160,9 +170,7 @@ int main() {
 // WI-FI SETUP ROUTINES
 // ==========================================
 
-// FIX: Full AT echo logging so every ESP response is visible over USB
 bool send_at_cmd(const char* cmd, const char* expected, uint32_t timeout_ms) {
-    // Flush RX garbage before sending
     while (pio_uart_rx_readable(pio_inst, sm_r)) pio_uart_rx_getc(pio_inst, sm_r);
 
     printf("[AT >>>] %s", cmd);
@@ -174,7 +182,7 @@ bool send_at_cmd(const char* cmd, const char* expected, uint32_t timeout_ms) {
     while (absolute_time_diff_us(get_absolute_time(), timeout) > 0) {
         if (pio_uart_rx_readable(pio_inst, sm_r)) {
             char c = pio_uart_rx_getc(pio_inst, sm_r);
-            printf("%c", c); // Echo every ESP byte to USB for debugging
+            printf("%c", c); 
             buf[idx++] = c;
             if (idx >= 511) break;
             buf[idx] = '\0';
@@ -187,16 +195,14 @@ bool send_at_cmd(const char* cmd, const char* expected, uint32_t timeout_ms) {
     return false;
 }
 
-// FIX: Correct AT command sequence — CIPMUX=0 BEFORE CIPMODE=1, sleep after CONNECT
 bool init_wifi_transparent() {
     printf("1/5 Waking ESP12F...\n");
     send_at_cmd("AT+RST\r\n", "ready", 5000);
-    sleep_ms(1500); // Extra settling time after reset
+    sleep_ms(1500); 
 
     printf("2/5 Setting Station Mode...\n");
     send_at_cmd("AT+CWMODE=1\r\n", "OK", 2000);
 
-    // FIX: Force single-connection mode FIRST — required before CIPMODE=1
     printf("2b/5 Forcing single-connection mode...\n");
     send_at_cmd("AT+CIPMUX=0\r\n", "OK", 2000);
 
@@ -207,17 +213,15 @@ bool init_wifi_transparent() {
         printf("[ERROR] WiFi join failed. Check SSID/password and 2.4GHz band.\n");
         return false;
     }
-    sleep_ms(500); // Let IP assignment settle
+    sleep_ms(500);
 
-    // FIX: CIPMODE=1 only after CIPMUX=0 is confirmed
     printf("4/5 Enabling transparent pipe mode...\n");
     if (!send_at_cmd("AT+CIPMODE=1\r\n", "OK", 2000)) {
         printf("[ERROR] CIPMODE=1 rejected — CIPMUX may not have applied.\n");
         return false;
     }
 
-    // FIX: Close any stale TCP connection before opening a new one
-    send_at_cmd("AT+CIPCLOSE\r\n", "OK", 2000); // Allowed to fail silently
+    send_at_cmd("AT+CIPCLOSE\r\n", "OK", 2000); 
 
     printf("4b/5 Opening TCP to Mac (%s:%s)...\n", MAC_IP, MAC_PORT);
     char tcp_cmd[128];
@@ -228,7 +232,6 @@ bool init_wifi_transparent() {
         return false;
     }
 
-    // FIX: Wait for TCP 3-way handshake to fully complete before CIPSEND
     sleep_ms(500);
 
     printf("5/5 Entering Transparent Pipe...\n");
@@ -249,28 +252,23 @@ bool init_wifi_transparent() {
 void scan_i2c_bus() {
     wprintf("\n--- AGGRESSIVE I2C BUS SCAN ---\n");
     
-    // 1. Force the bus to a safe 100kHz speed (BNO055 hates 400kHz)
     uint baud = i2c_init(I2C_PORT, 100 * 1000);
     wprintf("[DEBUG] I2C Baudrate reset to: %d Hz\n", baud);
     
-    // 2. Force internal pull-up resistors (Critical if you don't have physical ones)
-    // NOTE: Replace 4 and 5 below with whatever your actual SDA and SCL pin numbers are!
-    gpio_pull_up(4); // SDA Pin
-    gpio_pull_up(5); // SCL Pin
+    gpio_pull_up(4); 
+    gpio_pull_up(5); 
     wprintf("[DEBUG] Internal Pull-ups enabled.\n");
     wprintf("[DEBUG] Searching all 127 addresses with 10ms timeouts...\n\n");
 
     int count = 0;
     for (int addr = 1; addr < 128; ++addr) {
         uint8_t rxdata;
-        // Using timeout so a locked bus doesn't freeze the scan
         int ret = i2c_read_timeout_us(I2C_PORT, addr, &rxdata, 1, false, 10000);
         
         if (ret >= 0) {
             wprintf("[SUCCESS] Found device at 0x%02X!\n", addr);
             count++;
         } else if (ret == PICO_ERROR_GENERIC) {
-            // This just means "nobody answered", perfectly normal for empty addresses
         } else if (ret == PICO_ERROR_TIMEOUT) {
             wprintf("[WARNING] Address 0x%02X stretched the clock and timed out!\n", addr);
         }
@@ -286,7 +284,6 @@ void scan_i2c_bus() {
 void test_bno055() {
     wprintf("\n--- STREAMING BNO055 FUSION DATA ---\n");
 
-    // 1. Put into NDOF Mode
     uint8_t mode_cmd[] = {BNO055_OPR_MODE_REG, BNO055_MODE_NDOF};
     int w_ret = i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, mode_cmd, 2, false, 25000);
     
@@ -295,45 +292,33 @@ void test_bno055() {
         return;
     }
 
-    // Give the BNO055 fusion engine 100ms to boot up
     sleep_ms(100); 
 
-    // Flush leftover terminal keys
     while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
     wprintf("Press ANY key in terminal to stop stream...\n\n");
 
     while (wgetchar(0) == PICO_ERROR_TIMEOUT) {
         uint8_t reg = BNO055_EULER_H_LSB_REG;
-        
-        // FIX 1: Force the array to be all zeros so we NEVER print RAM garbage!
         uint8_t buffer[6] = {0, 0, 0, 0, 0, 0}; 
         
-        // Tell the BNO055 which register we want to read
         int write_success = i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, &reg, 1, true, 25000);
-        
-        // FIX 2: The BNO055 needs a microsecond to breathe before coughing up the data
         sleep_us(50); 
-        
-        // Read the 6 bytes
         int read_success = i2c_read_timeout_us(I2C_PORT, ADDR_BNO055, buffer, 6, false, 25000);
 
-        // FIX 3: If the sensor drops a packet, ignore it and try again instead of freezing!
         if (write_success < 0 || read_success < 0) {
             wprintf("\r[I2C WARNING] Packet dropped. Re-syncing...         ");
             sleep_ms(50);
             continue; 
         }
 
-        // Calculate degrees
         float heading = (int16_t)((buffer[1] << 8) | buffer[0]) / 16.0f;
         float roll    = (int16_t)((buffer[3] << 8) | buffer[2]) / 16.0f;
         float pitch   = (int16_t)((buffer[5] << 8) | buffer[4]) / 16.0f;
 
         wprintf("\rHeading: %6.2f | Roll: %6.2f | Pitch: %6.2f       ", heading, roll, pitch); 
-        sleep_ms(50); // 20Hz refresh
+        sleep_ms(50); 
     }
     
-    // Put sensor to sleep
     uint8_t sleep_cmd[] = {BNO055_OPR_MODE_REG, 0x00};
     i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, sleep_cmd, 2, false, 25000);
     
@@ -343,7 +328,6 @@ void test_bno055() {
 void test_ina219() {
     wprintf("\n--- STREAMING INA219 ---\n");
     
-    // FIX 1: Throw away leftover keys
     while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
     
     wprintf("Press ANY key in terminal to stop stream...\n\n");
@@ -359,7 +343,6 @@ void test_ina219() {
         i2c_read_timeout_us(I2C_PORT, ADDR_INA219, buf, 2, false, 25000);
         float shunt_voltage = (int16_t)((buf[0] << 8) | buf[1]) * 0.01f; 
 
-        // FIX 2: Use \n instead of \r
         wprintf("Bus: %5.2f V | Shunt: %6.2f mV\n", bus_voltage, shunt_voltage);
         sleep_ms(200);
     }
@@ -372,26 +355,22 @@ void test_ldr() {
     adc_gpio_init(26);
     adc_select_input(0);
     
-    // FIX 1: Throw away leftover keys
     while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
     
     wprintf("Press ANY key in terminal to stop stream...\n\n");
 
     while (wgetchar(0) == PICO_ERROR_TIMEOUT) {
         float voltage = adc_read() * 3.3f / 4096.0f;
-        // FIX 2: Use \n instead of \r
         wprintf("LDR Voltage: %4.2f V\n", voltage);
         sleep_ms(200);
     }
     wprintf("\nLDR Stream Stopped.\n");
 }
 
-// We use a global buffer to catch the audio data in the background
 int16_t sample_buffer[256];
 volatile int samples_read = 0;
 volatile bool new_data = false;
 
-// This callback fires automatically in the background when the DMA buffer is full
 void on_pdm_samples_ready() {
     samples_read = pdm_microphone_read(sample_buffer, 256);
     new_data = true;
@@ -400,13 +379,12 @@ void on_pdm_samples_ready() {
 void test_microphone() {
     wprintf("\n--- STREAMING SPH064 (VIA PIO & DMA) ---\n");
 
-    // 1. Configure the Microphone Library
     struct pdm_microphone_config config = {
         .gpio_data = MIC_DAT_PIN,
         .gpio_clk = MIC_CLK_PIN,
-        .pio = pio1, // Use pio1 so we don't conflict with your WiFi on pio0!
+        .pio = pio1, 
         .pio_sm = 0,
-        .sample_rate = 16000,       // 16 kHz audio
+        .sample_rate = 16000,       
         .sample_buffer_size = 256,
     };
 
@@ -418,19 +396,16 @@ void test_microphone() {
     pdm_microphone_set_samples_ready_handler(on_pdm_samples_ready);
     pdm_microphone_start();
 
-    // Flush leftover keys
     while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
     wprintf("Mic is LIVE. Speak into it! Press ANY key to stop...\n\n");
 
     int absolute_max_peak = 0;
 
     while (wgetchar(0) == PICO_ERROR_TIMEOUT) {
-        // Wait for the background hardware to hand us a new batch of audio
         if (new_data) {
             new_data = false;
             int local_peak = 0;
 
-            // Find the loudest noise in this specific batch of audio (PCM data)
             for (int i = 0; i < samples_read; i++) {
                 int amplitude = abs(sample_buffer[i]);
                 if (amplitude > local_peak) {
@@ -438,15 +413,13 @@ void test_microphone() {
                 }
             }
 
-            // Scale the raw 16-bit PCM value down so it fits nicely on a terminal bar graph
             int scaled_peak = local_peak / 500; 
-            if (scaled_peak > 25) scaled_peak = 25; // Cap it for the visualizer
+            if (scaled_peak > 25) scaled_peak = 25; 
             
             if (scaled_peak > absolute_max_peak) {
                 absolute_max_peak = scaled_peak;
             }
 
-            // Print the visualizer
             wprintf("Vol [");
             for (int v = 0; v < 25; v++) {
                 if (v < scaled_peak) wprintf("#"); else wprintf(" ");
@@ -454,11 +427,50 @@ void test_microphone() {
             wprintf("] Peak: %5d\n", local_peak);
         }
         
-        sleep_ms(10); // Tiny sleep, no CPU hogging!
+        sleep_ms(10); 
     }
 
-    // Cleanup
     pdm_microphone_stop();
     pdm_microphone_deinit();
     wprintf("\nMic Stream Stopped.\n");
+} 
+
+// ==========================================
+// TIME OF FLIGHT (ToF) TEST
+// ==========================================
+void test_tof() {
+    wprintf("\n--- STREAMING TOF SENSOR ---\n");
+
+    // Initialize the C++ Sensor Object and force it to use i2c1
+    VL53L0X my_tof(i2c1);
+    
+    my_tof.init();
+    my_tof.setTimeout(500);
+
+    // ==========================================
+    // THE MISSING LINE: Tell the laser to turn on!
+    // ==========================================
+    my_tof.startContinuous(); 
+
+    // Flush leftover keys
+    while (wgetchar(0) != PICO_ERROR_TIMEOUT); 
+    wprintf("Press ANY key in terminal to stop stream...\n\n");
+
+    while (wgetchar(0) == PICO_ERROR_TIMEOUT) {
+        // Read the continuous millimeter value
+        uint16_t distance_mm = my_tof.readRangeContinuousMillimeters();
+        
+        // Changed \r to \n so it doesn't glitch your terminal screen
+        if (my_tof.timeoutOccurred()) {
+            wprintf("Distance: TIMEOUT/OUT OF RANGE\n");
+        } else {
+            wprintf("Distance: %5d mm\n", distance_mm);
+        }
+        
+        sleep_ms(100); 
+    }
+    
+    // Turn the laser off when we exit the test
+    my_tof.stopContinuous();
+    wprintf("\nToF Stream Stopped.\n");
 }

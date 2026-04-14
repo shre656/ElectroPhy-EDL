@@ -16,6 +16,10 @@
 #include "uart_tx.pio.h"
 #include "uart_rx.pio.h"
 
+// #include "vl53l0x.h"
+
+// Declare your device struct globally so the whole VM can see it
+// vl53l0x_t my_tof; 
 // ==========================================
 //  WI-FI CONFIGURATION
 // ==========================================
@@ -35,7 +39,7 @@ bool wifi_transparent_active = false;
 // ==========================================
 // VM & HARDWARE CONFIGURATION
 // ==========================================
-#define LOOP_RATE_US 20000     // 50Hz Execution Loop
+#define LOOP_RATE_US 40000     // 50Hz Execution Loop
 #define MAX_REGS 64            
 #define MAX_INSTRUCTIONS 64
 
@@ -45,6 +49,8 @@ bool wifi_transparent_active = false;
 #define LDR_PIN 26
 #define MIC_CLK_PIN 22
 #define MIC_DAT_PIN 23
+
+
 
 // --- BNO055 REGISTERS ---
 #define ADDR_BNO055 0x28              // Change to 0x29 if using an alternate breakout
@@ -205,6 +211,9 @@ void on_pdm_samples_ready() {
 // ==========================================
 
 // Prints to BOTH USB and Wi-Fi simultaneously
+// ==========================================
+// CUSTOM DUAL-ROUTING I/O FUNCTIONS
+// ==========================================
 void vm_printf(const char *format, ...) {
     char buffer[512];
     va_list args;
@@ -212,9 +221,12 @@ void vm_printf(const char *format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
-    printf("%s", buffer); // Send to USB Serial Monitor
     if (wifi_transparent_active) {
-        pio_uart_tx_puts(pio_inst, sm_t, buffer); // Send over ESP-12F
+        // WE ARE WIRELESS: Route exclusively to the ESP-12F antenna.
+        pio_uart_tx_puts(pio_inst, sm_t, buffer); 
+    } else {
+        // WE ARE WIRED: Route to the Mac's USB Serial Monitor.
+        printf("%s", buffer); 
     }
 }
 
@@ -257,7 +269,7 @@ bool send_at_cmd(const char* cmd, const char* expected, uint32_t timeout_ms) {
 bool init_wifi_transparent() {
     printf("1/5 Waking ESP12F...\n");
     send_at_cmd("AT+RST\r\n", "ready", 5000);
-    sleep_ms(1500);
+    sleep_ms(2000);
 
     printf("2/5 Setting Station Mode...\n");
     send_at_cmd("AT+CWMODE=1\r\n", "OK", 2000);
@@ -269,7 +281,7 @@ bool init_wifi_transparent() {
     char join_cmd[128];
     sprintf(join_cmd, "AT+CWJAP=\"%s\",\"%s\"\r\n", WIFI_SSID, WIFI_PASS);
     if (!send_at_cmd(join_cmd, "WIFI GOT IP", 20000)) return false;
-    sleep_ms(500); 
+    sleep_ms(2000); 
 
     printf("4/5 Enabling transparent pipe mode...\n");
     if (!send_at_cmd("AT+CIPMODE=1\r\n", "OK", 2000)) return false;
@@ -280,7 +292,7 @@ bool init_wifi_transparent() {
     char tcp_cmd[128];
     sprintf(tcp_cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s\r\n", MAC_IP, MAC_PORT);
     if (!send_at_cmd(tcp_cmd, "CONNECT", 5000)) return false;
-    sleep_ms(500);
+    sleep_ms(2000);
 
     printf("5/5 Entering Transparent Pipe...\n");
     if (!send_at_cmd("AT+CIPSEND\r\n", ">", 3000)) return false;
@@ -316,6 +328,19 @@ void setup_hardware() {
     gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(SDA_PIN);
     gpio_pull_up(SCL_PIN);
+
+    // // 2b. Initialize ToF Sensor (Requires I2C, so after the above init)
+    // // Initialize the ToF struct and bind it to i2c1
+    // vl53l0x_init_struct(&my_tof, i2c1);
+    
+    // // Boot it up with a safe 40ms timeout to prevent Wi-Fi crashes
+    // if (vl53l0x_init(&my_tof, true)) {
+    //     printf("[HARDWARE] ToF Sensor Found!\n");
+    //     vl53l0x_set_timeout(&my_tof, 40); 
+    //     vl53l0x_start_continuous(&my_tof, 0);
+    // } else {
+    //     printf("[ERROR] ToF Sensor NOT FOUND on I2C bus!\n");
+    // }
 
     // Boot BNO055 into NDOF Fusion Mode
     uint8_t mode_cmd[] = {BNO055_OPR_MODE_REG, BNO055_MODE_NDOF};
@@ -363,22 +388,32 @@ int main() {
                 switch (inst->opcode) {
                     
                     case 0x01: { 
-                        // --- UPDATED FOR BNO055 ---
-                        uint8_t reg = BNO055_EULER_H_LSB_REG; 
-                        uint8_t data[6] = {0, 0, 0, 0, 0, 0}; 
+                        // --- UPDATED FOR 9-AXIS BNO055 FUSION ---
+                        uint8_t euler_reg = BNO055_EULER_H_LSB_REG; // 0x1A
+                        uint8_t lacc_reg  = 0x28;                   // Linear Accel Start Register
                         
-                        if (i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, &reg, 1, true, 5000) > 0) {
+                        uint8_t euler_data[6] = {0, 0, 0, 0, 0, 0}; 
+                        uint8_t lacc_data[6]  = {0, 0, 0, 0, 0, 0}; 
+                        
+                        // 1. Read Euler Angles (Heading, Roll, Pitch)
+                        if (i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, &euler_reg, 1, true, 5000) > 0) {
                             sleep_us(50); // Clock stretch buffer
-                            if (i2c_read_timeout_us(I2C_PORT, ADDR_BNO055, data, 6, false, 5000) > 0) {
-                                // Little-Endian Math, direct to degrees (/16)
-                                if (inst->out_regs[0] != 255) registers[inst->out_regs[0]] = (int16_t)((data[1] << 8) | data[0]) / 16.0f; // Heading
-                                if (inst->out_regs[1] != 255) registers[inst->out_regs[1]] = (int16_t)((data[3] << 8) | data[2]) / 16.0f; // Roll
-                                if (inst->out_regs[2] != 255) registers[inst->out_regs[2]] = (int16_t)((data[5] << 8) | data[4]) / 16.0f; // Pitch
-                                
-                                // Clear unused outputs (previously Gyro data on MPU)
-                                if (inst->out_regs[3] != 255) registers[inst->out_regs[3]] = 0.0f;
-                                if (inst->out_regs[4] != 255) registers[inst->out_regs[4]] = 0.0f;
-                                if (inst->out_regs[5] != 255) registers[inst->out_regs[5]] = 0.0f;
+                            if (i2c_read_timeout_us(I2C_PORT, ADDR_BNO055, euler_data, 6, false, 5000) > 0) {
+                                // Scale: 1 degree = 16 LSB
+                                if (inst->out_regs[0] != 255) registers[inst->out_regs[0]] = (int16_t)((euler_data[1] << 8) | euler_data[0]) / 16.0f; 
+                                if (inst->out_regs[1] != 255) registers[inst->out_regs[1]] = (int16_t)((euler_data[3] << 8) | euler_data[2]) / 16.0f; 
+                                if (inst->out_regs[2] != 255) registers[inst->out_regs[2]] = (int16_t)((euler_data[5] << 8) | euler_data[4]) / 16.0f; 
+                            }
+                        }
+
+                        // 2. Read Linear Acceleration (Gravity removed by fusion algorithm)
+                        if (i2c_write_timeout_us(I2C_PORT, ADDR_BNO055, &lacc_reg, 1, true, 5000) > 0) {
+                            sleep_us(50);
+                            if (i2c_read_timeout_us(I2C_PORT, ADDR_BNO055, lacc_data, 6, false, 5000) > 0) {
+                                // Scale: 1 m/s^2 = 100 LSB
+                                if (inst->out_regs[3] != 255) registers[inst->out_regs[3]] = (int16_t)((lacc_data[1] << 8) | lacc_data[0]) / 100.0f; 
+                                if (inst->out_regs[4] != 255) registers[inst->out_regs[4]] = (int16_t)((lacc_data[3] << 8) | lacc_data[2]) / 100.0f; 
+                                if (inst->out_regs[5] != 255) registers[inst->out_regs[5]] = (int16_t)((lacc_data[5] << 8) | lacc_data[4]) / 100.0f; 
                             }
                         }
                         break;
@@ -414,6 +449,22 @@ int main() {
                         }
                         break;
                     }
+
+                    // case 0x05: { 
+                    //     // Opcode 0x05: Time of Flight Sensor
+                    //     if (inst->out_regs[0] != 255) {
+                    //         // Read the distance using the new pure C driver
+                    //         uint16_t dist = vl53l0x_read_range_continuous_millimeters(&my_tof);
+                            
+                    //         // If it times out or points at open sky, clamp to 2000mm
+                    //         if (vl53l0x_timeout_occurred(&my_tof) || dist > 8000) {
+                    //             dist = 2000; 
+                    //         }
+                            
+                    //         registers[inst->out_regs[0]] = (float)dist;
+                    //     }
+                    //     break;
+                    // }
                     
 
                     case 0x10: { 

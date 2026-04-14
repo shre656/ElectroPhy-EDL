@@ -1,13 +1,14 @@
 {
-  "0x01": { "id": "mpu6050", "label": "MPU-6050 IMU", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 6, "config": { "outputs": ["Accel X", "Accel Y", "Accel Z", "Gyro X", "Gyro Y", "Gyro Z"] } },
+  "0x01": { "id": "bno055", "label": "BNO055 9-Axis", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 6, "config": { "outputs": ["Heading (°)", "Roll (°)", "Pitch (°)", "Lin Accel X", "Lin Accel Y", "Lin Accel Z"] } },
   "0x02": { "id": "ina219", "label": "INA219 Power", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 2, "config": { "outputs": ["Bus V", "Shunt mV"] } },
   "0x03": { "id": "ldr", "label": "LDR Light Sensor", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 1, "config": {} },
   "0x04": { "id": "mic", "label": "PDM Microphone", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 2, "config": { "outputs": ["Volume", "Frequency"] } },
+  "0x05": { "id": "tof_sensor", "label": "VL53L0X ToF", "category": "sensor", "domain": "chip", "inputs": 0, "outputs": 1, "config": { "outputs": ["Distance mm"] } },
   
   "0x10": { "id": "threshold", "label": "Threshold Clamp", "category": "logic", "domain": "chip", "inputs": 1, "outputs": 1, "config": {} },
-  "0x30": { "id": "transport_out", "label": " TX (To PC)", "category": "action", "domain": "chip", "inputs": 6, "outputs": 0, "config": { "inputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
+  "0x30": { "id": "transport_out", "label": "TX (To PC)", "category": "action", "domain": "chip", "inputs": 6, "outputs": 0, "config": { "inputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
   
-  "0xA0": { "id": "transport_in", "label": " RX (From Chip)", "category": "sensor", "domain": "pc", "inputs": 0, "outputs": 6, "config": { "outputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
+  "0xA0": { "id": "transport_in", "label": "RX (From Chip)", "category": "sensor", "domain": "pc", "inputs": 0, "outputs": 6, "config": { "outputs": ["CH 0", "CH 1", "CH 2", "CH 3", "CH 4", "CH 5"] } },
   "0xC0": { "id": "plot", "label": "Live Plot", "category": "action", "domain": "pc", "inputs": 4, "outputs": 0, "config": { "inputs": ["Trace 1", "Trace 2", "Trace 3", "Trace 4"] } },
   
   "0xA2": { "id": "math_add", "label": "Math: Add", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
@@ -15,5 +16,10 @@
   "0xA4": { "id": "math_fft", "label": "FFT (1D Spectrum)", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
   "0xA5": { "id": "math_hpf", "label": "High-Pass Filter", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
   "0xA6": { "id": "math_lpf", "label": "Low-Pass Filter", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
-  "0xC1": { "id": "plot_freq", "label": "Spectrum Plot", "category": "action", "domain": "pc", "inputs": 1, "outputs": 0, "config": {} }
+  "0xA7": { "id": "math_mul", "label": "Math: Multiply", "category": "math", "domain": "pc", "inputs": 1, "outputs": 1, "config": {} },
+  "0xC1": { "id": "plot_freq", "label": "Spectrum Plot", "category": "action", "domain": "pc", "inputs": 1, "outputs": 0, "config": {} },
+
+  "0xB0": { "id": "source_sine", "label": "Sine Wave Gen", "category": "math", "domain": "pc", "inputs": 0, "outputs": 1, "config": { "outputs": ["Wave Out"] } },
+  "0xB1": { "id": "source_rc", "label": "RC Charge Gen", "category": "math", "domain": "pc", "inputs": 0, "outputs": 1, "config": { "outputs": ["Voltage Out"] } },
+  "0xC2": { "id": "plot_scatter", "label": "Scatter Plot", "category": "action", "domain": "pc", "inputs": 2, "outputs": 0, "config": { "inputs": ["X Axis", "Y Axis"] } }
 }

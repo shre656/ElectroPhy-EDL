@@ -10,16 +10,21 @@ set(CMAKE_CXX_STANDARD 17)
 # Initialize the Pico SDK
 pico_sdk_init()
 add_subdirectory(pico-microphone)
+# add_subdirectory(VL53L0X-driver-pico-sdk-cpp) # Kept commented out as per your setup
 
-## ==============================================================================
+# ==============================================================================
 # TARGET 1: Production Firmware (For the final RP2350A board)
 # ==============================================================================
 add_executable(electrophy_main 
     main.c
+    vl53l0x.c    # <--- ADDED: The ToF sensor library source
 )
 
+# ADDED: Tell CMake where to find the VL53L0X.h header file for your wrapper
+target_include_directories(electrophy_main PRIVATE 
+    ${CMAKE_CURRENT_LIST_DIR}/VL53L0X-driver-pico-sdk-cpp 
+)
 
-# Add these two lines right here!
 pico_generate_pio_header(electrophy_main ${CMAKE_CURRENT_LIST_DIR}/hw_debug/uart_tx.pio)
 pico_generate_pio_header(electrophy_main ${CMAKE_CURRENT_LIST_DIR}/hw_debug/uart_rx.pio)
 
@@ -28,9 +33,9 @@ target_link_libraries(electrophy_main
     m
     hardware_i2c
     hardware_flash
-    hardware_adc            # <--- ADDED: For the LDR Light Sensor
-    hardware_pio            # <--- ADDED: Required for the mic's hardware clock
-    pico_pdm_microphone     # <--- ADDED: The DMA audio library
+    hardware_adc            
+    hardware_pio            
+    pico_pdm_microphone     
 )
 
 pico_enable_stdio_usb(electrophy_main 1)
@@ -61,17 +66,21 @@ pico_enable_stdio_uart(hw_debug 0)
 pico_add_extra_outputs(hw_debug)
 
 # ==============================================================================
-# TARGET 3: External Sensor Tester (Now with Wi-Fi!)
+# TARGET 3:  Sensor Tester (Now with Wi-Fi & ToF!)
 # ==============================================================================
 add_executable(test_sensors 
-    test_sensors.c
+    test_sensors.cpp
+    VL53L0X-driver-pico-sdk-cpp/VL53L0X.cpp   
 )
-target_include_directories(test_sensors PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pico-microphone/include)
+
+target_include_directories(test_sensors PRIVATE 
+    ${CMAKE_CURRENT_LIST_DIR}/pico-microphone/include
+    ${CMAKE_CURRENT_LIST_DIR}/VL53L0X-driver-pico-sdk-cpp 
+)
+
 # Tell CMake to compile the custom PIO UART scripts for this target too!
 pico_generate_pio_header(test_sensors ${CMAKE_CURRENT_LIST_DIR}/hw_debug/uart_tx.pio)
 pico_generate_pio_header(test_sensors ${CMAKE_CURRENT_LIST_DIR}/hw_debug/uart_rx.pio)
-
-
 
 target_link_libraries(test_sensors 
     pico_stdlib 
@@ -81,6 +90,7 @@ target_link_libraries(test_sensors
     hardware_pio     
     pico_pdm_microphone
 )
+
 pico_enable_stdio_usb(test_sensors 1)
 pico_enable_stdio_uart(test_sensors 0)
 pico_add_extra_outputs(test_sensors)
@@ -98,10 +108,34 @@ target_link_libraries(mic_usb_debug
     pico_stdlib 
     hardware_pio     
     pico_pdm_microphone
-    m   # <-- IMPORTANT: Links the math library required for FFT sine/cosine
+    m   
 )
 
 # Force USB only
 pico_enable_stdio_usb(mic_usb_debug 1)
 pico_enable_stdio_uart(mic_usb_debug 0)
 pico_add_extra_outputs(mic_usb_debug)
+
+# ==============================================================================
+# TARGET: Standalone ToF Pure C Tester
+# ==============================================================================
+add_executable(test_tof_c 
+    test_tof.c
+    vl53l0x.c
+)
+
+# Ensure the compiler can find vl53l0x.h in the current directory
+target_include_directories(test_tof_c PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+
+# We only need standard library and I2C for this test
+target_link_libraries(test_tof_c 
+    pico_stdlib 
+    hardware_i2c
+)
+
+# Route output to USB so we can see it in the terminal
+pico_enable_stdio_usb(test_tof_c 1)
+pico_enable_stdio_uart(test_tof_c 0)
+
+# Generate the .uf2 file
+pico_add_extra_outputs(test_tof_c)
